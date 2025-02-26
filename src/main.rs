@@ -3,26 +3,14 @@
 //! This program performs quality control, feature extraction (including k-mer frequencies,
 //! optional codon usage, GC content, and damage scores), incremental PCA with progress updates,
 //! and clustering using DBSCAN with spatial indexing (via a kd-tree) and parallel neighbor precomputation.
-//! It then performs taxonomic assignment and can launch an interactive dashboard.
-
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
-use bio::io::fastq;
-use csv::Writer;
 use env_logger;
-use indicatif::{ProgressBar, ProgressStyle};
-use kiddo::float::kdtree::KdTree;
-use kiddo::float::distance::SquaredEuclidean;
 use log::{error, info};
-use ndarray::{Array1, Array2, Axis};
-use ndarray_linalg::Eig;
-use rand::distributions::Distribution;
-use rand_distr::Gamma;
-//use rayon::prelude::*;
+use ndarray::{Array1, Array2};
 use serde::Serialize;
 use serde_json;
 use std::collections::HashMap;
-use std::path::Path;
 use clap::{Parser, Command, Arg, ArgGroup};
 use colored::*;
 
@@ -621,7 +609,7 @@ fn assign_taxonomy(
         let authentic = stat.avg_damage >= damage_threshold;
         
         // For demonstration, assign simple taxonomy based on GC content ranges
-        // In a real implementation, this would use reference matching, ML models, etc.
+        // later implementation would use reference matching, ML models, etc.
         let tax_name = if authentic {
             match stat.avg_gc {
                 gc if gc < 0.35 => "Low GC (authentic)",
@@ -1362,7 +1350,7 @@ r#"<!DOCTYPE html>
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
-/// Improved DBSCAN clustering implementation with dynamic dimensions
+/// DBSCAN clustering implementation with dynamic dimensions
 /// This handles the dimensional mismatch and optimizes the clustering algorithm
 
 /// Dynamic dimensional DBSCAN implementation using a trait to handle different dimensions
@@ -1702,7 +1690,7 @@ fn compute_k_distance_for_dim<const D: usize>(data: &ndarray::Array2<f64>, k: us
     
     kth_distances
 }
-/// Main function with improved parameter handling and automatic epsilon detection
+/// Main function
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     
@@ -1757,7 +1745,7 @@ fn main() {
     // Start timing the pipeline
     let start_time = std::time::Instant::now();
     
-    // Run the pipeline with full parameter validation
+    // Run the pipeline
     match run_pipeline(args) {
         Ok(_) => {
             let duration = start_time.elapsed();
@@ -1795,7 +1783,7 @@ version 0.2.0
     println!();
 }
 
-/// Setup a visually enhanced help menu for MADERA
+/// Setup the help menu and command line arguments
 fn setup_cli() -> Command {
     Command::new("MADERA")
         .version("0.2.0")
