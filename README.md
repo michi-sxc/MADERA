@@ -39,6 +39,8 @@ Key features:
 
 3. The binary will be available at `target/release/madera_pipeline`
 
+   Or use the pre-compiled binary at 'releases'
+
 ## Usage
 
 ### Basic Command
