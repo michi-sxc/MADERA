@@ -10,9 +10,18 @@ use log::{error, info};
 use ndarray::{Array1, Array2};
 use serde::Serialize;
 use serde_json;
-use std::collections::HashMap;
 use clap::{Parser, Command, Arg, ArgGroup};
 use colored::*;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, RwLock};
+use rayon::prelude::*;
+use bio::alignment::{pairwise::*, Alignment};
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref GLOBAL_CACHE: Arc<ReadPairCache> = Arc::new(ReadPairCache::new());
+}
 
 /// Command-line arguments with additions for automatic clustering parameters
 #[derive(Parser, Debug)]
@@ -126,7 +135,7 @@ struct ClusterSummary {
 
 // Required structs for processing
 #[derive(Clone, Debug)]
-struct Read {
+pub struct Read {
     id: String,
     seq: String,
     quality: Option<Vec<u8>>,
@@ -150,13 +159,14 @@ struct ClusterStat {
     taxonomy: String,
 }
 
+
 /// Performs quality control on reads from a FASTQ file
 fn quality_control(fastq_path: &str, min_length: usize) -> Vec<Read> {
     use bio::io::fastq;
     use std::path::Path;
     
     let path = Path::new(fastq_path);
-    let mut reader = match fastq::Reader::from_file(path) {
+    let reader = match fastq::Reader::from_file(path) {
         Ok(reader) => reader,
         Err(e) => {
             log::error!("Failed to open FASTQ file: {}", e);
@@ -238,45 +248,1457 @@ fn damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, Dama
     scores.into_inner().unwrap()
 }
 
-/// Compute damage scores for a single read
+/// Enhanced structs needed for the improved damage assessment
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DamagePosition {
+    position: usize,
+    base: char,
+    context: String,
+    quality: Option<u8>,
+    damage_prob: f64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct DamagePattern {
+    positions: Vec<DamagePosition>,
+    decay_rate: f64,
+    change_point: Option<usize>,
+    log_likelihood_ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ReadPairInfo {
+    id: String,
+    overlap_region: Option<(usize, usize)>,
+    overlap_mismatches: Vec<(usize, char, char)>, // position, base1, base2
+    is_ancient_pattern: bool,
+}
+
+/// Main damage assessment function - integrates multiple methods
 fn compute_damage_scores(read: &Read, window_size: usize) -> DamageScore {
+    // Get the max window size to analyze (we'll use a dynamic approach)
+    let max_window = std::cmp::min(window_size * 3, read.seq.len() / 4);
+    
+    // 1. First approach: Change point analysis
+    let change_point_results = detect_damage_change_points(read, max_window);
+    
+    // 2. Second approach: Position-specific decay model
+    let decay_model_results = fit_decay_damage_model(read, max_window);
+    
+    // 3. Third approach: Read pair overlap analysis if paired data is available
+    // This would be implemented via a cache of read pairs - we simulate it here
+    let read_pair_results = analyze_read_pair_overlaps(read);
+    
+    // 4. Combine results using an ensemble approach
+    let combined_score = combine_damage_evidence(
+        &change_point_results, 
+        &decay_model_results,
+        &read_pair_results,
+        read
+    );
+    
+    // Return the comprehensive damage score
+    DamageScore {
+        damage5: combined_score.prime5_score,
+        damage3: combined_score.prime3_score,
+        combined: combined_score.authenticity_score,
+    }
+}
+
+/// APPROACH 1: Change-point analysis for damage detection
+/// This method finds where damage patterns significantly change along the read
+fn detect_damage_change_points(read: &Read, window_size: usize) -> ChangePointResults {
     let seq = &read.seq;
+    let seq_len = seq.len();
     
-    // Simple model: consider C->T transitions at 5' end and G->A at 3' end as indicators of damage
-    // In a real implementation this would use more sophisticated methods
-    
-    if seq.len() < window_size * 2 {
-        return DamageScore {
-            damage5: 0.0,
-            damage3: 0.0,
-            combined: 0.0,
+    // Skip very short reads
+    if seq_len < 15 {
+        return ChangePointResults {
+            prime5_change_point: None,
+            prime3_change_point: None,
+            prime5_pvalue: 1.0,
+            prime3_pvalue: 1.0,
+            prime5_score: 0.0,
+            prime3_score: 0.0,
         };
     }
     
-    // For demonstration: 
-    // - Higher scores for C/T rich 5' ends (potential C->T damage)
-    // - Higher scores for G/A rich 3' ends (potential G->A damage)
+    // Extract sequence segments for analysis
+    let five_prime = &seq[0..std::cmp::min(window_size, seq_len / 2)];
+    let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(window_size, seq_len / 2))..];
     
-    // 5' damage (looking at first 'window_size' bases)
-    let five_prime = &seq[0..window_size];
-    let five_prime_score = five_prime.chars()
-        .filter(|&c| c == 'C' || c == 'T')
-        .count() as f64 / window_size as f64;
+    // Collect base frequencies at each position
+    let five_freqs = collect_position_frequencies(five_prime, true);
+    let three_freqs = collect_position_frequencies(three_prime, false);
     
-    // 3' damage (looking at last 'window_size' bases)
-    let three_prime = &seq[seq.len() - window_size..];
-    let three_prime_score = three_prime.chars()
-        .filter(|&c| c == 'G' || c == 'A')
-        .count() as f64 / window_size as f64;
+    // Run change point detection algorithm
+    let five_change = find_change_point(&five_freqs, 'T', 'C');
+    let three_change = find_change_point(&three_freqs, 'A', 'G');
     
-    // Combined score (weighted average)
-    let combined = 0.5 * five_prime_score + 0.5 * three_prime_score;
-    
-    DamageScore {
-        damage5: five_prime_score,
-        damage3: three_prime_score,
-        combined,
+    // Return results
+    ChangePointResults {
+        prime5_change_point: five_change.position,
+        prime3_change_point: three_change.position,
+        prime5_pvalue: five_change.pvalue,
+        prime3_pvalue: three_change.pvalue,
+        prime5_score: calculate_change_point_score(&five_freqs, five_change.position),
+        prime3_score: calculate_change_point_score(&three_freqs, three_change.position),
     }
+}
+
+/// Collect frequency of each base at each position
+fn collect_position_frequencies(segment: &str, _is_five_prime: bool) -> Vec<[f64; 4]> {
+    let len = segment.len();
+    let mut freqs = vec![[0.0; 4]; len]; // [A, C, G, T] at each position
+    
+    let bases = segment.chars().collect::<Vec<_>>();
+    
+    for (i, base) in bases.iter().enumerate() {
+        let idx = match base.to_ascii_uppercase() {
+            'A' => 0,
+            'C' => 1,
+            'G' => 2,
+            'T' => 3,
+            _ => continue, // Skip non-ACGT bases
+        };
+        
+        // We're analyzing just one read, so frequency is either 0 or 1
+        freqs[i][idx] = 1.0;
+    }
+    
+    freqs
+}
+
+/// Find the point where base frequencies significantly change
+/// Using a statistical change point detection algorithm
+fn find_change_point(position_freqs: &Vec<[f64; 4]>, target_base_char: char, _source_base_char: char) -> ChangePointResult {
+    let target_base = base_to_index(target_base_char);
+    let num_positions = position_freqs.len();
+    
+    if num_positions < 6 {
+        return ChangePointResult {
+            position: None,
+            pvalue: 1.0,
+            statistic: 0.0,
+        };
+    }
+    
+    // Compute cumulative frequencies
+    let mut cumul_target = vec![0.0; num_positions + 1];
+    let mut cumul_total = vec![0.0; num_positions + 1];
+    
+    for i in 0..num_positions {
+        cumul_target[i+1] = cumul_target[i] + position_freqs[i][target_base];
+        cumul_total[i+1] = cumul_total[i] + 1.0; // Each position has one base
+    }
+    
+    // Find the position with maximum CUSUM statistic
+    let mut max_statistic = 0.0;
+    let mut change_pos = None;
+    
+    // Calculate background rate (from positions far from end)
+    let background_start = std::cmp::min(6, num_positions / 2);
+    let background_end = num_positions;
+    let background_count = cumul_target[background_end] - cumul_target[background_start];
+    let background_total = cumul_total[background_end] - cumul_total[background_start];
+    let background_rate = if background_total > 0.0 {
+        background_count / background_total
+    } else {
+        0.25 // Default to uniform distribution
+    };
+    
+    // Binary segmentation to find the change point
+    for k in 2..(num_positions - 2) {
+        let n1 = cumul_total[k] - cumul_total[0];
+        let n2 = cumul_total[num_positions] - cumul_total[k];
+        
+        if n1 < 3.0 || n2 < 3.0 {
+            continue; // Need at least 3 positions for statistics
+        }
+        
+        let count1 = cumul_target[k] - cumul_target[0];
+        let count2 = cumul_target[num_positions] - cumul_target[k];
+        
+        let p1 = count1 / n1;
+        let p2 = count2 / n2;
+        
+        // Calculate CUSUM statistic
+        let statistic = (p1 - p2).abs() * (n1 * n2 / (n1 + n2)).sqrt();
+        
+        if statistic > max_statistic {
+            max_statistic = statistic;
+            change_pos = Some(k);
+        }
+    }
+    
+    // Calculate p-value using bootstrap method
+    // This is a simplified approximation
+    let pvalue = if max_statistic > 0.0 {
+        let z_score = max_statistic / background_rate.sqrt();
+        approximate_pvalue(z_score)
+    } else {
+        1.0
+    };
+    
+    ChangePointResult {
+        position: change_pos,
+        pvalue,
+        statistic: max_statistic,
+    }
+}
+
+/// Convert base character to array index
+fn base_to_index(base: char) -> usize {
+    match base.to_ascii_uppercase() {
+        'A' => 0,
+        'C' => 1,
+        'G' => 2,
+        'T' => 3,
+        _ => 0, // Default
+    }
+}
+
+/// Calculate score based on change point
+fn calculate_change_point_score(position_freqs: &Vec<[f64; 4]>, change_point: Option<usize>) -> f64 {
+    let cp = match change_point {
+        Some(pos) => pos,
+        None => return 0.1, // No significant change point
+    };
+    
+    // If change point is detected, calculate damage score
+    if cp < 3 || cp >= position_freqs.len() - 2 {
+        // Change point too close to edges - less reliable
+        return 0.3;
+    }
+    
+    // Calculate average target base frequency before and after change point
+    let t_idx = base_to_index('T');
+    let a_idx = base_to_index('A');
+    
+    let before_t_freq: f64 = position_freqs[0..cp].iter().map(|f| f[t_idx]).sum::<f64>() / cp as f64;
+    let after_t_freq: f64 = position_freqs[cp..].iter().map(|f| f[t_idx]).sum::<f64>() / (position_freqs.len() - cp) as f64;
+    
+    let before_a_freq: f64 = position_freqs[0..cp].iter().map(|f| f[a_idx]).sum::<f64>() / cp as f64;
+    let after_a_freq: f64 = position_freqs[cp..].iter().map(|f| f[a_idx]).sum::<f64>() / (position_freqs.len() - cp) as f64;
+    
+    // Higher score if we see a dramatic drop at the change point
+    let t_ratio = if after_t_freq > 0.0 { before_t_freq / after_t_freq } else { 1.0 };
+    let a_ratio = if after_a_freq > 0.0 { before_a_freq / after_a_freq } else { 1.0 };
+    
+    let score = ((t_ratio - 1.0) + (a_ratio - 1.0)) / 2.0;
+    0.2 + 0.6 * (score.min(2.0) / 2.0) // Normalize to [0.2, 0.8]
+}
+
+/// Approximation of p-value from z-score
+fn approximate_pvalue(z_score: f64) -> f64 {
+    if z_score <= 0.0 {
+        return 1.0;
+    }
+    
+    // Simple approximation of the normal CDF
+    let x = z_score / 1.414213562373095;
+    let t = 1.0 / (1.0 + 0.2316419 * x.abs());
+    let d = 0.3989423 * (-x * x / 2.0).exp();
+    let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+    
+    if x > 0.0 { 1.0 - p } else { p }
+}
+
+/// APPROACH 2: Exponential decay model for damage 
+/// This method fits a model where damage decays exponentially from read ends
+fn fit_decay_damage_model(read: &Read, window_size: usize) -> DecayModelResults {
+    let seq = &read.seq;
+    let seq_len = seq.len();
+    
+    if seq_len < 10 {
+        return DecayModelResults {
+            prime5_lambda: 0.0,
+            prime3_lambda: 0.0,
+            prime5_model_fit: 0.0,
+            prime3_model_fit: 0.0,
+            log_likelihood_ratio: 0.0,
+        };
+    }
+    
+    // Extract sequence segments
+    let five_prime = &seq[0..std::cmp::min(window_size, seq_len / 2)];
+    let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(window_size, seq_len / 2))..];
+    
+    // Determine if bases are potential deaminated sites
+    let five_deam = identify_potential_deamination(five_prime, true);
+    let three_deam = identify_potential_deamination(three_prime, false);
+    
+    // Fit exponential decay model to observed damage patterns
+    let five_model = fit_exponential_model(&five_deam);
+    let three_model = fit_exponential_model(&three_deam);
+    
+    // Calculate log-likelihood ratio (damage model vs. uniform model)
+    let llr = calculate_log_likelihood_ratio(&five_deam, &three_deam, &five_model, &three_model);
+    
+    DecayModelResults {
+        prime5_lambda: five_model.lambda,
+        prime3_lambda: three_model.lambda,
+        prime5_model_fit: five_model.fit_quality,
+        prime3_model_fit: three_model.fit_quality,
+        log_likelihood_ratio: llr,
+    }
+}
+
+/// Identify positions that may have undergone deamination
+fn identify_potential_deamination(segment: &str, is_five_prime: bool) -> Vec<(usize, f64)> {
+    let mut deam_sites = Vec::new();
+    let bases = segment.chars().collect::<Vec<_>>();
+    
+    for (i, &base) in bases.iter().enumerate() {
+        let (damage_prob, is_deaminated) = if is_five_prime {
+            // 5' end: Look for C→T transitions
+            match base.to_ascii_uppercase() {
+                'T' => {
+                    // Enhanced context analysis
+                    let (_, prob) = analyze_five_prime_context(i, &bases);
+                    (prob, true)
+                },
+                'C' => (0.1, false), // C that could deaminate but hasn't
+                _ => (0.0, false),   // Other bases not relevant
+            }
+        } else {
+            // 3' end: Look for G→A transitions
+            match base.to_ascii_uppercase() {
+                'A' => {
+                    // A could be a deaminated G
+                    // Enhanced context analysis for 3' end
+                    let (_, prob) = analyze_three_prime_context(i, &bases);
+                    (prob, true)
+                },
+                'G' => {
+                    // G that could deaminate but hasn't yet
+                    // Enhanced susceptibility analysis
+                    let (_, prob) = analyze_g_susceptibility(i, &bases);
+                    (prob, false)
+                },
+                _ => (0.0, false),   // Other bases not relevant
+            }
+        };
+        
+        if is_deaminated || damage_prob > 0.0 {
+            deam_sites.push((i, damage_prob));
+        }
+    }
+    
+    deam_sites
+}
+
+/// Analyze the sequence context at 5' end for more accurate damage assessment
+fn analyze_five_prime_context(pos: usize, bases: &[char]) -> (&'static str, f64) {
+    if pos + 1 >= bases.len() {
+        return ("end", 0.6);
+    }
+    
+    let next_base = bases[pos + 1].to_ascii_uppercase();
+    
+    // CpG has highest deamination rate
+    if next_base == 'G' {
+        ("CpG", 0.85)
+    } 
+    // Check if within GC-rich context (higher deamination propensity)
+    else if pos + 3 < bases.len() {
+        let gc_count = bases[pos+1..pos+4].iter()
+            .filter(|&&b| b.to_ascii_uppercase() == 'G' || b.to_ascii_uppercase() == 'C')
+            .count();
+        
+        if gc_count >= 2 {
+            ("GC-rich", 0.75)
+        } else {
+            ("standard", 0.6)
+        }
+    } else {
+        ("standard", 0.6)
+    }
+}
+
+/// Analyze 3' end context for A that may be deaminated G
+fn analyze_three_prime_context(pos: usize, bases: &[char]) -> (&'static str, f64) {
+    // Distance from 3' end (for weighting)
+    let distance_from_end = bases.len().saturating_sub(pos + 1);
+    
+    // Position factor - damage decreases with distance from end
+    let position_factor = match distance_from_end {
+        0 => 1.0,             // Last base
+        1 => 0.9,             // Second-to-last base
+        2 => 0.8,             // Third-to-last base
+        d if d < 5 => 0.7,    // Positions 3-4 from end
+        d if d < 10 => 0.6,   // Positions 5-9 from end
+        _ => 0.5,             // Further positions
+    };
+    
+    // Terminal position - special case
+    if pos == 0 {
+        return ("terminal", 0.6 * position_factor);
+    }
+    
+    // CpG context check (highest deamination rate)
+    let prev_base = bases[pos - 1].to_ascii_uppercase();
+    if prev_base == 'C' {
+        return ("CpG", 0.8 * position_factor);
+    }
+    
+    // GC content analysis (higher GC = higher deamination rate)
+    if pos >= 3 {
+        let window_size = std::cmp::min(3, pos);
+        let gc_count = bases[pos-window_size..pos].iter()
+            .filter(|&&b| b.to_ascii_uppercase() == 'G' || b.to_ascii_uppercase() == 'C')
+            .count();
+        
+        let gc_ratio = gc_count as f64 / window_size as f64;
+        
+        if gc_ratio > 0.66 {
+            return ("GC-rich", (0.7 * position_factor));
+        } else if gc_ratio > 0.33 {
+            return ("mixed-GC", (0.6 * position_factor));
+        }
+    }
+    
+    // Default context
+    ("standard", 0.55 * position_factor)
+}
+
+/// Analyze C for deamination susceptibility (when it hasn't deaminated yet)
+#[allow(dead_code)]
+fn analyze_c_susceptibility(pos: usize, bases: &[char]) -> (&'static str, f64) {
+    // CpG context check (highest susceptibility)
+    if pos + 1 < bases.len() && bases[pos + 1].to_ascii_uppercase() == 'G' {
+        return ("CpG", 0.2);
+    }
+    
+    // Position from 5' end
+    let position_factor = if pos < 3 {
+        0.15  // Higher susceptibility near 5' end
+    } else if pos < 7 {
+        0.12
+    } else {
+        0.08  // Lower susceptibility further from end
+    };
+    
+    ("standard", position_factor)
+}
+
+/// Analyze G for deamination susceptibility (when it hasn't deaminated yet)
+fn analyze_g_susceptibility(pos: usize, bases: &[char]) -> (&'static str, f64) {
+    // CpG context check (highest susceptibility)
+    if pos > 0 && bases[pos - 1].to_ascii_uppercase() == 'C' {
+        return ("CpG", 0.18);
+    }
+    
+    // Distance from 3' end
+    let distance_from_end = bases.len().saturating_sub(pos + 1);
+    let position_factor = if distance_from_end < 3 {
+        0.14  // Higher susceptibility near 3' end
+    } else if distance_from_end < 7 {
+        0.1
+    } else {
+        0.07  // Lower susceptibility further from end
+    };
+    
+    ("standard", position_factor)
+}
+
+/// Fit an exponential decay model to potential deamination sites
+fn fit_exponential_model(deam_sites: &[(usize, f64)]) -> ExponentialModel {
+    if deam_sites.len() < 3 {
+        return ExponentialModel {
+            lambda: 0.0,
+            amplitude: 0.0,
+            fit_quality: 0.0,
+        };
+    }
+    
+    // Calculate initial estimates based on observed pattern
+    // Lambda controls how quickly damage decreases from end
+    let pos_probs: Vec<(f64, f64)> = deam_sites.iter()
+        .map(|&(pos, prob)| (pos as f64, prob))
+        .collect();
+    
+    // Try a range of lambda values and find the best fit
+    // This is a simplified numerical optimization
+    let mut best_lambda = 0.0;
+    let mut best_amplitude = 0.0;
+    let mut best_fit = 0.0;
+    
+    for lambda_test in (1..50).map(|x| x as f64 * 0.05) {
+        let (amplitude, fit) = test_exponential_fit(&pos_probs, lambda_test);
+        if fit > best_fit {
+            best_fit = fit;
+            best_lambda = lambda_test;
+            best_amplitude = amplitude;
+        }
+    }
+    
+    ExponentialModel {
+        lambda: best_lambda,
+        amplitude: best_amplitude,
+        fit_quality: best_fit,
+    }
+}
+
+/// Test how well a specific lambda value fits the data
+fn test_exponential_fit(positions: &[(f64, f64)], lambda: f64) -> (f64, f64) {
+    if positions.is_empty() || lambda <= 0.0 {
+        return (0.0, 0.0);
+    }
+    
+    // Exponential model: damage_prob = amplitude * exp(-lambda * position)
+    // Estimate amplitude from first position
+    let mut sum_predicted = 0.0;
+    let mut sum_actual = 0.0;
+    let mut sum_squared_diff = 0.0;
+    let mut count = 0.0;
+    
+    for &(pos, prob) in positions {
+        if prob > 0.0 {
+            let predicted = (-lambda * pos).exp();
+            sum_predicted += predicted;
+            sum_actual += prob;
+            sum_squared_diff += (predicted - prob).powi(2);
+            count += 1.0;
+        }
+    }
+    
+    // Calculate amplitude that minimizes error
+    let amplitude = if sum_predicted > 0.0 {
+        sum_actual / sum_predicted
+    } else {
+        0.0
+    };
+    
+    // Calculate fit quality (1.0 = perfect fit, 0.0 = no fit)
+    let fit_quality = if count > 0.0 && sum_actual > 0.0 {
+        1.0 - (sum_squared_diff / count).sqrt() / (sum_actual / count)
+    } else {
+        0.0
+    };
+    
+    (amplitude, fit_quality.max(0.0))
+}
+
+/// Calculate log-likelihood ratio between damage model and null model
+fn calculate_log_likelihood_ratio(
+    deam5: &[(usize, f64)],
+    deam3: &[(usize, f64)],
+    model5: &ExponentialModel,
+    model3: &ExponentialModel
+) -> f64 {
+    if deam5.is_empty() && deam3.is_empty() {
+        return 0.0;
+    }
+    
+    let mut ll_damage = 0.0;
+    let mut ll_null = 0.0;
+    
+    // Calculate likelihood under damage model for 5' end
+    for &(pos, prob) in deam5 {
+        if prob > 0.0 {
+            let model_prob = model5.amplitude * (-model5.lambda * pos as f64).exp();
+            ll_damage += prob * model_prob.ln() + (1.0 - prob) * (1.0 - model_prob).ln();
+            
+            // Null model: uniform probability of damage
+            let null_prob: f64 = 0.25; // Assuming 25% chance of any base
+            ll_null += prob * null_prob.ln() + (1.0 - prob) * (1.0 - null_prob).ln();
+        }
+    }
+    
+    // Calculate likelihood under damage model for 3' end
+    for &(pos, prob) in deam3 {
+        if prob > 0.0 {
+            let model_prob = model3.amplitude * (-model3.lambda * pos as f64).exp();
+            ll_damage += prob * model_prob.ln() + (1.0 - prob) * (1.0 - model_prob).ln();
+            
+            // Null model: uniform probability of damage
+            let null_prob: f64 = 0.25; // Assuming 25% chance of any base
+            ll_null += prob * null_prob.ln() + (1.0 - prob) * (1.0 - null_prob).ln();
+        }
+    }
+    
+    // Return log-likelihood ratio
+    ll_damage - ll_null
+}
+
+
+/// APPROACH 3: Read pair overlap analysis for damage detection
+/// Enhanced read pair overlap analysis system for ancient DNA authentication
+/// This subsystem provides reference-free detection of damage patterns
+/// by analyzing mismatches in overlapping regions of paired-end reads
+
+/// Cache for paired reads to avoid redundant alignment calculations
+#[derive(Default)]
+pub struct ReadPairCache {
+    // Maps read ID to its paired read information
+    cache: RwLock<HashMap<String, PairedReadInfo>>,
+    // Cache overlap analysis results
+    overlap_results: RwLock<HashMap<String, ReadPairResults>>,
+    // Tracks paired read IDs for batch resolution
+    unprocessed_pairs: Mutex<HashSet<String>>,
+    // Statistics for cache performance
+    stats: Mutex<CacheStats>,
+}
+
+#[derive(Default, Clone)]
+pub struct CacheStats {
+    lookups: usize,
+    hits: usize,
+    inserts: usize,
+    pair_found: usize,
+    pair_not_found: usize,
+    successful_alignments: usize,
+}
+
+/// Information about a read and its paired read
+#[derive(Clone)]
+struct PairedReadInfo {
+    #[allow(dead_code)]
+    read1_id: String,
+    #[allow(dead_code)]
+    read2_id: String,
+    read1_seq: String, 
+    read2_seq: String,
+    read1_qual: Option<Vec<u8>>,
+    read2_qual: Option<Vec<u8>>,
+    #[allow(dead_code)]
+    processed: bool,
+}
+
+/// Detailed mismatch information for overlap analysis
+#[derive(Clone, Debug)]
+struct MismatchInfo {
+    position: usize,      // Position within the overlap region
+    read1_pos: usize,     // Original position in read1
+    #[allow(dead_code)]
+    read2_pos: usize,     // Original position in read2
+    #[allow(dead_code)]
+    read1_base: char,     // Base in read1
+    #[allow(dead_code)]
+    read2_base: char,     // Base in read2
+    read1_qual: Option<u8>, // Quality score for read1 base
+    read2_qual: Option<u8>, // Quality score for read2 base
+    is_damage_pattern: bool, // Whether this matches an aDNA damage pattern
+    pattern_type: DamagePatternType, // Type of damage pattern if any
+}
+
+/// Types of damage patterns in ancient DNA
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum DamagePatternType {
+    CTTransition5Prime,  // C→T at 5' end (read1)
+    GATransition3Prime,  // G→A at 3' end (read1)
+    CTTransition3Prime,  // C→T at 3' end (read2)
+    GATransition5Prime,  // G→A at 5' end (read2)
+    OtherMismatch,       // Any other mismatch
+}
+
+impl ReadPairCache {
+    pub fn new() -> Self {
+        ReadPairCache {
+            cache: RwLock::new(HashMap::new()),
+            overlap_results: RwLock::new(HashMap::new()),
+            unprocessed_pairs: Mutex::new(HashSet::new()),
+            stats: Mutex::new(CacheStats::default()),
+        }
+    }
+    /// Prune old entries from the cache when it grows too large
+    #[allow(dead_code)]
+    fn prune_cache(&self, max_size: usize) {
+        let mut cache = self.cache.write().unwrap();
+        if cache.len() > max_size {
+            // Remove oldest entries first (would typically use an LRU strategy)
+            // This simplified version just keeps the most recent entries
+            let mut entries: Vec<_> = cache.drain().collect();
+            entries.sort_by(|(_, a), (_, b)| {
+                // Sort by most recently added/updated
+                a.processed.cmp(&b.processed).reverse()
+            });
+            
+            // Keep only the max_size most recent entries
+            for (k, v) in entries.into_iter().take(max_size) {
+                cache.insert(k, v);
+            }
+        }
+    }
+    /// Add a read to the cache and try to find its pair
+    pub fn add_read(&self, read: &Read) -> bool {
+        let mut cache = self.cache.write().unwrap();
+        let mut stats = self.stats.lock().unwrap();
+        let mut unprocessed = self.unprocessed_pairs.lock().unwrap();
+        
+        // Extract the base ID without /1 or /2 suffix
+        let (base_id, read_number) = parse_read_id(&read.id);
+        
+        // Skip if we can't determine read number
+        if read_number == 0 {
+            return false;
+        }
+        
+        // Look for the paired read in the cache
+        let pair_id = if read_number == 1 {
+            format!("{}/2", base_id)
+        } else {
+            format!("{}/1", base_id)
+        };
+        
+        let paired_read = if read_number == 1 {
+            if let Some(pair_info) = cache.get(&pair_id) {
+                // Found the paired read (read2)
+                stats.pair_found += 1;
+                Some(PairedReadInfo {
+                    read1_id: read.id.clone(),
+                    read2_id: pair_id,
+                    read1_seq: read.seq.clone(),
+                    read2_seq: pair_info.read1_seq.clone(),
+                    read1_qual: read.quality.clone(),
+                    read2_qual: pair_info.read1_qual.clone(),
+                    processed: false,
+                })
+            } else {
+                // Paired read not found yet
+                stats.pair_not_found += 1;
+                None
+            }
+        } else {
+            // This is read2, look for read1
+            if let Some(pair_info) = cache.get(&pair_id) {
+                // Found the paired read (read1)
+                stats.pair_found += 1;
+                Some(PairedReadInfo {
+                    read1_id: pair_id,
+                    read2_id: read.id.clone(),
+                    read1_seq: pair_info.read1_seq.clone(),
+                    read2_seq: read.seq.clone(),
+                    read1_qual: pair_info.read1_qual.clone(),
+                    read2_qual: read.quality.clone(),
+                    processed: false,
+                })
+            } else {
+                // Paired read not found yet
+                stats.pair_not_found += 1;
+                None
+            }
+        };
+        
+        // If we found a pair, store the completed pair info and mark for processing
+        if let Some(pair_info) = paired_read {
+            // Add to unprocessed set for batch processing
+            unprocessed.insert(base_id.clone());
+            // Update the cache
+            cache.insert(base_id, pair_info);
+            stats.inserts += 1;
+            true
+        } else {
+            // Store this read in case its pair comes later
+            let self_info = PairedReadInfo {
+                read1_id: read.id.clone(),
+                read2_id: String::new(),
+                read1_seq: read.seq.clone(),
+                read2_seq: String::new(),
+                read1_qual: read.quality.clone(),
+                read2_qual: None,
+                processed: false,
+            };
+            
+            // Store using the appropriate ID format
+            let cache_id = if read_number == 1 {
+                format!("{}/1", base_id)
+            } else {
+                format!("{}/2", base_id)
+            };
+            
+            cache.insert(cache_id, self_info);
+            stats.inserts += 1;
+            false
+        }
+    }
+    
+    /// Process all unprocessed read pairs in the cache
+    pub fn process_all_pairs(&self) {
+        let unprocessed_ids: Vec<String> = {
+            let mut unprocessed = self.unprocessed_pairs.lock().unwrap();
+            let ids = unprocessed.iter().cloned().collect();
+            unprocessed.clear();
+            ids
+        };
+        
+        // Process in parallel using Rayon
+        unprocessed_ids.par_iter().for_each(|id| {
+            self.process_read_pair(id);
+        });
+    }
+    
+    /// Process a specific read pair
+    fn process_read_pair(&self, base_id: &str) {
+        // First check if we already have analyzed this pair
+        {
+            let results = self.overlap_results.read().unwrap();
+            if results.contains_key(base_id) {
+                return;
+            }
+        }
+        
+        // Get the paired read info
+        let pair_info = {
+            let cache = self.cache.read().unwrap();
+            match cache.get(base_id) {
+                Some(info) => info.clone(),
+                None => return,
+            }
+        };
+        
+        // Skip if not a complete pair
+        if pair_info.read2_seq.is_empty() {
+            return;
+        }
+        
+        // Analyze the overlap between the paired reads
+        let results = analyze_read_pair_overlap(&pair_info);
+        
+        // Store the results
+        {
+            let mut results_cache = self.overlap_results.write().unwrap();
+            results_cache.insert(base_id.to_string(), results);
+        }
+        
+        // Update stats
+        {
+            let mut stats = self.stats.lock().unwrap();
+            stats.successful_alignments += 1;
+        }
+    }
+    
+    /// Get the overlap analysis results for a specific read
+    pub fn get_overlap_results(&self, read_id: &str) -> Option<ReadPairResults> {
+        let mut stats = self.stats.lock().unwrap();
+        stats.lookups += 1;
+        
+        // Extract the base ID
+        let (base_id, _) = parse_read_id(read_id);
+        
+        // Check cache first
+        {
+            let results = self.overlap_results.read().unwrap();
+            if let Some(cached_results) = results.get(&base_id) {
+                stats.hits += 1;
+                return Some((*cached_results).clone());
+            }
+        }
+        
+        // Check if we have the pair but haven't processed it yet
+        {
+            let cache = self.cache.read().unwrap();
+            if let Some(_info) = cache.get(&base_id) {
+                // Process this pair specifically
+                drop(cache); // Release lock before processing
+                self.process_read_pair(&base_id);
+                
+                // Now try again to get the results
+                let results = self.overlap_results.read().unwrap();
+                return results.get(&base_id).cloned();
+            }
+        }
+        
+        None
+    }
+    
+    /// Get cache statistics
+    pub fn get_stats(&self) -> CacheStats {
+        self.stats.lock().unwrap().clone()
+    }
+}
+
+/// Parse a read ID to extract the base ID and read number
+/// Returns (base_id, read_number) where read_number is 1, 2, or 0 if unknown
+fn parse_read_id(read_id: &str) -> (String, u8) {
+    // Common formats:
+    // - SEQID/1 and SEQID/2
+    // - SEQID.1 and SEQID.2
+    // - SEQID_1 and SEQID_2
+    // - SEQID-1 and SEQID-2
+    // - SEQID:1 and SEQID:2
+    // - SEQID R1 and SEQID R2
+    
+    if read_id.contains("/1") {
+        (read_id.replace("/1", ""), 1)
+    } else if read_id.contains("/2") {
+        (read_id.replace("/2", ""), 2)
+    } else if read_id.contains(".1") && read_id.ends_with(".1") {
+        (read_id.replace(".1", ""), 1)
+    } else if read_id.contains(".2") && read_id.ends_with(".2") {
+        (read_id.replace(".2", ""), 2)
+    } else if read_id.contains("_1") && read_id.ends_with("_1") {
+        (read_id.replace("_1", ""), 1)
+    } else if read_id.contains("_2") && read_id.ends_with("_2") {
+        (read_id.replace("_2", ""), 2)
+    } else if read_id.contains("-1") && read_id.ends_with("-1") {
+        (read_id.replace("-1", ""), 1)
+    } else if read_id.contains("-2") && read_id.ends_with("-2") {
+        (read_id.replace("-2", ""), 2)
+    } else if read_id.contains(":1") && read_id.ends_with(":1") {
+        (read_id.replace(":1", ""), 1)
+    } else if read_id.contains(":2") && read_id.ends_with(":2") {
+        (read_id.replace(":2", ""), 2)
+    } else if read_id.contains(" R1") && read_id.ends_with(" R1") {
+        (read_id.replace(" R1", ""), 1)
+    } else if read_id.contains(" R2") && read_id.ends_with(" R2") {
+        (read_id.replace(" R2", ""), 2)
+    } else {
+        // Can't determine read number
+        (read_id.to_string(), 0)
+    }
+}
+
+/// Analyze a read using the read pair overlap approach
+/// This is the main entry point for read pair analysis from other parts of the pipeline
+pub fn analyze_read_pair_overlaps(read: &Read) -> ReadPairResults {
+    // Access the global cache
+    lazy_static! {
+        static ref GLOBAL_CACHE: Arc<ReadPairCache> = Arc::new(ReadPairCache::new());
+    }
+    
+    // First, add this read to the cache
+    let paired = GLOBAL_CACHE.add_read(read);
+    
+    // If this completed a pair, process it
+    if paired {
+        GLOBAL_CACHE.process_all_pairs();
+    }
+    
+    // Try to get results for this read
+    if let Some(results) = GLOBAL_CACHE.get_overlap_results(&read.id) {
+        return results;
+    }
+    
+    // If no results found, return default
+    ReadPairResults {
+        has_overlap: false,
+        overlap_size: 0,
+        c_to_t_mismatches: 0,
+        g_to_a_mismatches: 0,
+        other_mismatches: 0,
+        pair_support_score: 0.5, // Neutral score
+    }
+}
+
+/// This is the internal function that analyzes a pair of reads
+/// It is called by the ReadPairCache when processing pairs
+fn analyze_read_pair_overlap(pair_info: &PairedReadInfo) -> ReadPairResults {
+    // First check if both reads exist
+    if pair_info.read1_seq.is_empty() || pair_info.read2_seq.is_empty() {
+        return ReadPairResults {
+            has_overlap: false,
+            overlap_size: 0,
+            c_to_t_mismatches: 0,
+            g_to_a_mismatches: 0,
+            other_mismatches: 0,
+            pair_support_score: 0.0,
+        };
+    }
+    
+    // Reverse complement read2 for alignment with read1
+    let read2_rc = reverse_complement(&pair_info.read2_seq);
+    
+    // Perform semi-global alignment to find the overlap
+    let alignment = align_reads(&pair_info.read1_seq, &read2_rc);
+    
+    // Extract the overlapping region
+    let (overlap_region, overlap_size) = extract_overlap_region(&alignment);
+    
+    // If no significant overlap found, return empty results
+    if overlap_size < 10 {
+        return ReadPairResults {
+            has_overlap: false,
+            overlap_size: 0,
+            c_to_t_mismatches: 0,
+            g_to_a_mismatches: 0,
+            other_mismatches: 0,
+            pair_support_score: 0.0,
+        };
+    }
+    
+    // Analyze mismatches in the overlap
+    let mismatches = analyze_mismatches(
+        &pair_info.read1_seq, 
+        &read2_rc, 
+        &overlap_region, 
+        &pair_info.read1_qual, 
+        &pair_info.read2_qual
+    );
+    
+    // Count damage-specific mismatches
+    let (c_to_t, g_to_a, other) = count_damage_mismatches(&mismatches);
+    
+    // Calculate support score based on damage pattern
+    let support_score = calculate_damage_support_score(&mismatches, overlap_size);
+    
+    // Return the results
+    ReadPairResults {
+        has_overlap: true,
+        overlap_size,
+        c_to_t_mismatches: c_to_t,
+        g_to_a_mismatches: g_to_a,
+        other_mismatches: other,
+        pair_support_score: support_score,
+    }
+}
+
+/// Reverse complement a DNA sequence
+fn reverse_complement(seq: &str) -> String {
+    seq.chars()
+        .rev()
+        .map(|base| match base {
+            'A' => 'T',
+            'T' => 'A',
+            'G' => 'C',
+            'C' => 'G',
+            'a' => 't',
+            't' => 'a',
+            'g' => 'c',
+            'c' => 'g',
+            'N' => 'N',
+            'n' => 'n',
+            _ => 'N',
+        })
+        .collect()
+}
+
+/// Align two reads to find their overlap
+fn align_reads(read1: &str, read2: &str) -> Alignment {
+    // Configure the aligner for DNA sequences
+    // Using semi-global alignment to allow overhangs
+    let score = |a: u8, b: u8| {
+        if a == b {
+            1i32  // Match
+        } else {
+            -1i32 // Mismatch
+        }
+    };
+    
+    let mut aligner = Aligner::new(-5, -1, score);
+    
+    // Convert strings to byte slices for the aligner
+    let read1_bytes = read1.as_bytes();
+    let read2_bytes = read2.as_bytes();
+    
+    // Perform the alignment
+    aligner.semiglobal(read1_bytes, read2_bytes)
+}
+
+/// Extract the overlap region from an alignment
+fn extract_overlap_region(alignment: &Alignment) -> ((usize, usize), usize) {
+    let read1_start = alignment.xstart;
+    let read1_end = alignment.xend;
+    let overlap_size = read1_end - read1_start;
+    
+    ((read1_start, read1_end), overlap_size)
+}
+
+/// Analyze mismatches in the overlapping region
+fn analyze_mismatches(
+    read1: &str,
+    read2: &str,
+    overlap: &(usize, usize),
+    qual1: &Option<Vec<u8>>,
+    qual2: &Option<Vec<u8>>
+) -> Vec<MismatchInfo> {
+    let (start, end) = *overlap;
+    let mut mismatches = Vec::new();
+    
+    // Check if reads are long enough
+    if start >= read1.len() || end > read1.len() || start >= read2.len() || end > read2.len() {
+        return mismatches;
+    }
+    
+    // Extract the overlapping regions
+    let read1_overlap = &read1[start..end];
+    let read2_overlap = &read2[start..end];
+    
+    let read1_chars: Vec<char> = read1_overlap.chars().collect();
+    let read2_chars: Vec<char> = read2_overlap.chars().collect();
+    
+    for i in 0..read1_chars.len() {
+        if i >= read2_chars.len() {
+            break;
+        }
+        
+        let base1 = read1_chars[i];
+        let base2 = read2_chars[i];
+        
+        // Skip non-standard bases
+        if !is_standard_base(base1) || !is_standard_base(base2) {
+            continue;
+        }
+        
+        // Get quality scores if available
+        let qual1_val = if let Some(ref quality) = qual1 {
+            if start + i < quality.len() {
+                Some(quality[start + i])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        let qual2_val = if let Some(ref quality) = qual2 {
+            if start + i < quality.len() {
+                Some(quality[start + i])
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        
+        // Check if bases match
+        if base1.to_ascii_uppercase() != base2.to_ascii_uppercase() {
+            // Determine if this is a damage pattern
+            let (is_damage, pattern_type) = classify_damage_pattern(base1, base2, start + i, read1.len());
+            
+            mismatches.push(MismatchInfo {
+                position: i,
+                read1_pos: start + i,
+                read2_pos: start + i,
+                read1_base: base1,
+                read2_base: base2,
+                read1_qual: qual1_val,
+                read2_qual: qual2_val,
+                is_damage_pattern: is_damage,
+                pattern_type,
+            });
+        }
+    }
+    
+    mismatches
+}
+
+/// Check if a character is a standard DNA base
+fn is_standard_base(base: char) -> bool {
+    matches!(base.to_ascii_uppercase(), 'A' | 'C' | 'G' | 'T')
+}
+
+/// Classify whether a mismatch is a typical ancient DNA damage pattern
+fn classify_damage_pattern(base1: char, base2: char, position: usize, read_length: usize) -> (bool, DamagePatternType) {
+    let base1_upper = base1.to_ascii_uppercase();
+    let base2_upper = base2.to_ascii_uppercase();
+    
+    // Determine if we're near the 5' end (start) or 3' end
+    // Use a dynamic threshold based on read length
+    let terminal_threshold = std::cmp::min(10, read_length / 5);
+    
+    let near_5_prime = position < terminal_threshold;
+    let near_3_prime = position >= read_length.saturating_sub(terminal_threshold);
+    
+    // C→T at 5' end of read1
+    if near_5_prime && base1_upper == 'T' && base2_upper == 'C' {
+        return (true, DamagePatternType::CTTransition5Prime);
+    }
+    
+    // G→A at 3' end of read1
+    if near_3_prime && base1_upper == 'A' && base2_upper == 'G' {
+        return (true, DamagePatternType::GATransition3Prime);
+    }
+    
+    // C→T at 3' end of read2 (appears as G→A in read1)
+    if near_3_prime && base1_upper == 'G' && base2_upper == 'A' {
+        return (true, DamagePatternType::CTTransition3Prime);
+    }
+    
+    // G→A at 5' end of read2 (appears as C→T in read1)
+    if near_5_prime && base1_upper == 'C' && base2_upper == 'T' {
+        return (true, DamagePatternType::GATransition5Prime);
+    }
+    
+    // Any other mismatch
+    (false, DamagePatternType::OtherMismatch)
+}
+
+/// Count the different types of damage-related mismatches
+fn count_damage_mismatches(mismatches: &[MismatchInfo]) -> (usize, usize, usize) {
+    let mut c_to_t = 0;
+    let mut g_to_a = 0;
+    let mut other = 0;
+    
+    for mismatch in mismatches {
+        match mismatch.pattern_type {
+            DamagePatternType::CTTransition5Prime | DamagePatternType::GATransition5Prime => c_to_t += 1,
+            DamagePatternType::GATransition3Prime | DamagePatternType::CTTransition3Prime => g_to_a += 1,
+            DamagePatternType::OtherMismatch => other += 1,
+        }
+    }
+    
+    (c_to_t, g_to_a, other)
+}
+
+/// Calculate a support score based on damage patterns
+fn calculate_damage_support_score(mismatches: &[MismatchInfo], overlap_size: usize) -> f64 {
+    if mismatches.is_empty() || overlap_size < 10 {
+        return 0.5; // Neutral score for no data
+    }
+    
+    // Count by pattern type
+    let mut c_to_t_5p = 0;
+    let mut g_to_a_3p = 0;
+    let mut other_mm = 0;
+    
+    for mismatch in mismatches {
+        match mismatch.pattern_type {
+            DamagePatternType::CTTransition5Prime => c_to_t_5p += 1,
+            DamagePatternType::GATransition3Prime => g_to_a_3p += 1,
+            DamagePatternType::OtherMismatch => other_mm += 1,
+            _ => {}
+        }
+    }
+    
+    let total_mismatches = c_to_t_5p + g_to_a_3p + other_mm;
+    if total_mismatches == 0 {
+        return 0.5; // Neutral score
+    }
+    
+    // Calculate the damage ratio (proportion of mismatches that match aDNA pattern)
+    let damage_ratio = (c_to_t_5p + g_to_a_3p) as f64 / total_mismatches as f64;
+    
+    // Calculate position-weighted score (damage should be concentrated at ends)
+    let mut position_score = 0.0;
+    let mut total_weight = 0.0;
+    
+    for mismatch in mismatches {
+        // Only consider damage pattern mismatches
+        if !mismatch.is_damage_pattern {
+            continue;
+        }
+        
+        // Apply quality score weighting
+        let quality_weight = match (mismatch.read1_qual, mismatch.read2_qual) {
+            (Some(q1), Some(q2)) if q1 > 20 && q2 > 20 => 1.0,  // High quality mismatch
+            (Some(q1), Some(q2)) if q1 > 15 && q2 > 15 => 0.8,  // Medium quality
+            (Some(_), Some(_)) => 0.5,                         // Lower quality
+            _ => 0.7,                                          // No quality scores
+        };
+        
+        // Determine position relative to appropriate end
+        let end_distance = match mismatch.pattern_type {
+            DamagePatternType::CTTransition5Prime | DamagePatternType::GATransition5Prime => 
+                mismatch.read1_pos,
+            DamagePatternType::GATransition3Prime | DamagePatternType::CTTransition3Prime => 
+                overlap_size - mismatch.position,
+            _ => overlap_size / 2, // Middle position for non-specific
+        };
+        
+        // Calculate weight (higher for positions closer to ends)
+        let position_weight = (10.0 / (end_distance as f64 + 1.0)).min(1.0);
+        position_score += position_weight * quality_weight;  // Apply quality weighting
+        total_weight += quality_weight;
+    }
+    
+    // Normalize position score
+    let end_concentration = if total_weight > 0.0 { 
+        position_score / total_weight
+    } else { 
+        0.5 
+    };
+    
+    // Combine damage ratio and position concentration
+    let support_score = 0.7 * damage_ratio + 0.3 * end_concentration;
+    
+    // Normalize to 0.0-1.0 range
+    support_score.max(0.0).min(1.0)
+}
+/// Combine evidence from multiple methods and return final scores
+fn combine_damage_evidence(
+    change_point: &ChangePointResults,
+    decay_model: &DecayModelResults,
+    read_pair: &ReadPairResults,
+    read: &Read
+) -> CombinedDamageResults {
+    // Adjust weights based on fragment length
+    let fragment_length = read.seq.len();
+    
+    // For very short fragments, prioritize change point detection
+    let cp_base_weight = if fragment_length < 50 {
+        0.5  // Short fragments: rely more on change point detection
+    } else if fragment_length < 100 {
+        0.4  // Medium fragments
+    } else {
+        0.3  // Longer fragments
+    };
+    
+    // Weight change point evidence by statistical significance
+    let cp_weight = if change_point.prime5_pvalue < 0.05 || change_point.prime3_pvalue < 0.05 {
+        cp_base_weight  // Higher weight if change point is statistically significant
+    } else {
+        cp_base_weight * 0.5  // Lower weight if not significant
+    };
+    
+    // Weight decay model by quality of fit and log-likelihood ratio
+    let model_weight = if decay_model.log_likelihood_ratio > 2.0 && 
+                        decay_model.prime5_model_fit > 0.6 && 
+                        decay_model.prime3_model_fit > 0.4 {
+        0.5  // Strong evidence from decay model
+    } else if decay_model.log_likelihood_ratio > 0.5 {
+        0.4  // Moderate evidence
+    } else {
+        0.3  // Weak evidence
+    };
+    
+    // Weight read pair evidence by quality of overlap and damage pattern
+    let pair_weight = if read_pair.has_overlap && read_pair.overlap_size > 20 {
+        // Calculate the ratio of damage-specific mismatches to total mismatches
+        let total_mismatches = read_pair.c_to_t_mismatches + read_pair.g_to_a_mismatches + read_pair.other_mismatches;
+        let damage_ratio = if total_mismatches > 0 {
+            (read_pair.c_to_t_mismatches + read_pair.g_to_a_mismatches) as f64 / total_mismatches as f64
+        } else {
+            0.0
+        };
+        
+        if damage_ratio > 0.7 && total_mismatches > 3 {
+            0.5  // Strong damage signal in overlap
+        } else if damage_ratio > 0.5 {
+            0.4  // Moderate damage signal
+        } else if read_pair.has_overlap {
+            0.2  // Weak signal but has overlap
+        } else {
+            0.0  // No relevant signal
+        }
+    } else {
+        0.0  // No overlap or too small
+    };
+    
+    // Normalize weights to sum to 1.0
+    let total_weight = cp_weight + model_weight + pair_weight;
+    let cp_norm = cp_weight / total_weight;
+    let model_norm = model_weight / total_weight;
+    let pair_norm = pair_weight / total_weight;
+    
+    // Compute weighted scores for each end
+    let prime5_score = 
+        cp_norm * change_point.prime5_score +
+        model_norm * normalize_score(decay_model.prime5_model_fit, 0.0, 1.0, 0.1, 0.9) +
+        pair_norm * read_pair.pair_support_score;
+    
+    let prime3_score = 
+        cp_norm * change_point.prime3_score +
+        model_norm * normalize_score(decay_model.prime3_model_fit, 0.0, 1.0, 0.1, 0.9) +
+        pair_norm * read_pair.pair_support_score;
+    
+    // Calculate authenticity factors
+    let model_support = if decay_model.log_likelihood_ratio > 0.0 {
+        normalize_score(decay_model.log_likelihood_ratio, 0.0, 10.0, 0.0, 1.0)
+    } else {
+        0.0
+    };
+    
+    let cp_support = if change_point.prime5_pvalue < 0.10 || change_point.prime3_pvalue < 0.10 {
+        1.0 - (change_point.prime5_pvalue.min(change_point.prime3_pvalue) * 10.0).min(1.0)
+    } else {
+        0.0
+    };
+    
+    // Consider fragment length (shorter fragments more likely ancient)
+    let length_factor = fragment_length_factor(read.seq.len());
+    
+    // Consider balance between 5' and 3' damage (authentic aDNA typically has both)
+    let balance_factor = if prime5_score > 0.2 && prime3_score > 0.2 {
+        // Calculate how balanced the damage is between ends
+        1.0 - (prime5_score - prime3_score).abs() / (prime5_score + prime3_score).max(0.1)
+    } else {
+        0.5  // Neutral factor when damage scores are low
+    };
+    
+    // Calculate final authenticity score with multiple factors
+    let authenticity = 
+        0.35 * ((prime5_score + prime3_score) / 2.0) +
+        0.25 * ((model_support + cp_support) / 2.0) +
+        0.25 * length_factor +
+        0.15 * balance_factor;
+    
+    CombinedDamageResults {
+        prime5_score,
+        prime3_score,
+        authenticity_score: authenticity,
+        method_weights: [cp_norm, model_norm, pair_norm],
+    }
+}
+
+/// Helper function to normalize scores to a specific range
+fn normalize_score(value: f64, min_in: f64, max_in: f64, min_out: f64, max_out: f64) -> f64 {
+    if max_in == min_in {
+        return min_out;
+    }
+    let normalized = (value - min_in) / (max_in - min_in);
+    min_out + normalized * (max_out - min_out)
+}
+
+/// Calculate a factor based on fragment length
+fn fragment_length_factor(length: usize) -> f64 {
+    match length {
+        0..=50 => 0.9,    // Very short: likely ancient
+        51..=100 => 0.7,  // Short: may be ancient
+        101..=150 => 0.5, // Medium: uncertain
+        151..=200 => 0.3, // Long: less likely ancient
+        _ => 0.1,         // Very long: unlikely ancient
+    }
+}
+
+/// Output structure for the change point method
+#[derive(Debug)]
+struct ChangePointResult {
+    position: Option<usize>,
+    pvalue: f64,
+    statistic: f64,
+}
+
+#[derive(Debug)]
+struct ChangePointResults {
+    prime5_change_point: Option<usize>,
+    prime3_change_point: Option<usize>,
+    prime5_pvalue: f64,
+    prime3_pvalue: f64,
+    prime5_score: f64,
+    prime3_score: f64,
+}
+
+/// Output structure for the exponential decay model
+#[derive(Debug)]
+struct ExponentialModel {
+    lambda: f64,      // Decay rate parameter
+    amplitude: f64,   // Initial amplitude
+    fit_quality: f64, // How well the model fits (0-1)
+}
+
+#[derive(Debug)]
+struct DecayModelResults {
+    prime5_lambda: f64,
+    prime3_lambda: f64,
+    prime5_model_fit: f64,
+    prime3_model_fit: f64,
+    log_likelihood_ratio: f64,
+}
+
+/// Output structure for read pair analysis
+#[derive(Debug, Clone)]
+pub struct ReadPairResults {
+    has_overlap: bool,
+    overlap_size: usize,
+    c_to_t_mismatches: usize,
+    g_to_a_mismatches: usize,
+    other_mismatches: usize,
+    pair_support_score: f64,
+}
+
+/// Combined results from all methods
+#[derive(Debug)]
+struct CombinedDamageResults {
+    prime5_score: f64,
+    prime3_score: f64,
+    authenticity_score: f64,
+    #[allow(dead_code)]
+    method_weights: [f64; 3], // Weights used for change-point, decay model, and read pair
 }
 
 /// Generate all possible k-mers of a given length
@@ -423,7 +1845,7 @@ fn incremental_pca(
             
             // Eigendecomposition
             let eig = cov.eig().unwrap();
-            let (eigenvalues, eigenvectors) = eig;
+            let (_eigenvalues, eigenvectors) = eig;
             // Convert complex eigenvectors to real values
             for i in 0..total_features {
                 for j in 0..total_features {
@@ -1187,6 +2609,9 @@ r#"<!DOCTYPE html>
                         elbowPoint = i;
                     }}
                 }}
+            }} else {{
+                // Default to the middle point if not enough points
+                elbowIdx = n / 2;
             }}
             
             // Add a trace to highlight the elbow point
@@ -1369,7 +2794,6 @@ macro_rules! impl_dbscan_for_dim {
                 
                 use indicatif::{ProgressBar, ProgressStyle};
                 use std::collections::{VecDeque, HashMap, HashSet};
-                use rayon::prelude::*;
                 use kiddo::float::kdtree::KdTree;
                 use kiddo::float::distance::SquaredEuclidean;
                 use std::cmp::min;
@@ -1986,26 +3410,64 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     };
     
     // Calculate total features dimension for PCA
-    let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 4;
+    let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 7;  // Updated: 4 basic features + 3 new model-based features
     info!("Total feature space dimension: {}", total_features);
     
     // Define feature extractor closure
     let feature_extractor = |read: &Read| -> Vec<f64> {
         let mut features = Vec::with_capacity(total_features);
+        
         // k-mer frequencies
         let freq = compute_kmer_freq(&read.seq, args.k, &kmers_list);
         features.extend(kmers_list.iter().map(|kmer| *freq.get(kmer).unwrap_or(&0.0)));
+        
         // Optional codon usage
         if let Some(ref codon_list) = codon_list {
             let usage = compute_codon_usage(&read.seq);
             features.extend(codon_list.iter().map(|codon| *usage.get(codon).unwrap_or(&0.0)));
         }
+        
         // Additional intrinsic features
         features.push(compute_gc_content(&read.seq));
+        
+        // Use our enhanced damage assessment
         let damage = compute_damage_scores(read, args.damage_window);
+        
+        // Add both individual end scores and the combined score
         features.push(damage.damage5);
         features.push(damage.damage3);
         features.push(damage.combined);
+        
+        // Add additional derived features from our models
+        let cp_results = detect_damage_change_points(read, args.damage_window);
+        let decay_results = fit_decay_damage_model(read, args.damage_window);
+        let read_pair_results = analyze_read_pair_overlaps(read);
+        
+        // Add change point confidence
+        features.push(1.0 - cp_results.prime5_pvalue.min(cp_results.prime3_pvalue));
+        
+        // Add model fit quality
+        features.push(decay_results.prime5_model_fit);
+        features.push(decay_results.prime3_model_fit);
+        
+        // Add ratio between 5' and 3' damage (damage symmetry feature)
+        let damage_ratio = if damage.damage3 > 0.0 {
+            damage.damage5 / damage.damage3
+        } else {
+            2.0 // Default when no 3' damage
+        };
+        features.push(damage_ratio.min(3.0).max(0.33)); // Clip to reasonable range
+        
+        // Add position-specific decay rate features
+        features.push(decay_results.prime5_lambda);
+        features.push(decay_results.prime3_lambda);
+        
+        // Add read pair support as a feature
+        features.push(read_pair_results.pair_support_score);
+        
+        // Add log-likelihood ratio as a feature (normalized to [0,1] range)
+        features.push((decay_results.log_likelihood_ratio.max(-5.0).min(5.0) + 5.0) / 10.0);
+        
         features
     };
     
@@ -2147,3 +3609,4 @@ fn truncate_pca_dimensions(data: &ndarray::Array2<f64>, dimensions: usize) -> nd
     
     result
 }
+
