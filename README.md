@@ -21,7 +21,7 @@ Key features:
 
 ### Option 1: Pre-compiled Binaries
 
-1. Download the appropriate binary for your platform from the [Releases](https://github.com/michisxc/MADERA/releases) page
+1. Download the appropriate binary for your platform from the [Releases](https://github.com/michi-sxc/MADERA/releases) page
 
 2. Extract the archive:
    ```bash
