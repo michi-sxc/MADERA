@@ -19,46 +19,27 @@ Key features:
 
 ## Installation
 
-### Option 1: Pre-compiled Binaries
+### Option 1: Pre-compiled Binaries (Linux only for now)
 
 1. Download the appropriate binary for your platform from the [Releases](https://github.com/michi-sxc/MADERA/releases) page
 
 2. Extract the archive:
    ```bash
-   # Linux/macOS
-   unzip madera_pipeline-linux-amd64.zip
+   # Linux
+   unzip madera.zip
    chmod +x madera
    ```
 
 3. Install required dependencies:
    - **Linux**: `sudo apt-get install libopenblas-dev`
-   - **macOS**: `brew install openblas`
 
 4. Move the binary to a location in your PATH (optional):
    ```bash
-   # Linux/macOS
-   sudo mv madera_pipeline /usr/local/bin/
+   # Linux
+   sudo mv madera /usr/local/bin/
    ```
 
-### Option 2: Docker Container
-
-1. Pull the Docker image:
-   ```bash
-   docker pull username/madera_pipeline:latest
-   ```
-
-2. Run MADERA with Docker:
-   ```bash
-   docker run -v $(pwd):/data username/madera --fastq /data/samples.fastq --output /data/results.csv
-   ```
-
-3. For the interactive dashboard:
-   ```bash
-   docker run -v $(pwd):/data -p 8080:8080 username/madera --fastq /data/samples.fastq --dashboard
-   ```
-   Then access the dashboard at http://localhost:8080
-
-### Option 3: Build from Source
+### Option 2: Build from Source
 
 #### Prerequisites
 
