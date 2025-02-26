@@ -1,4 +1,4 @@
-# MADERA Pipeline
+# MADERA 
 
 Metagenomic Ancient DNA Evaluation and Reference-free Analysis (MADERA) is a computational pipeline designed for processing, analyzing, and clustering ancient DNA without requiring reference genomes.
 
@@ -49,12 +49,12 @@ Key features:
 
 2. Run MADERA with Docker:
    ```bash
-   docker run -v $(pwd):/data username/madera_pipeline --fastq /data/samples.fastq --output /data/results.csv
+   docker run -v $(pwd):/data username/madera --fastq /data/samples.fastq --output /data/results.csv
    ```
 
 3. For the interactive dashboard:
    ```bash
-   docker run -v $(pwd):/data -p 8080:8080 username/madera_pipeline --fastq /data/samples.fastq --dashboard
+   docker run -v $(pwd):/data -p 8080:8080 username/madera --fastq /data/samples.fastq --dashboard
    ```
    Then access the dashboard at http://localhost:8080
 
@@ -78,27 +78,27 @@ Key features:
    cargo build --release
    ```
 
-3. The binary will be available at `target/release/madera_pipeline`
+3. The binary will be available at `target/release/madera`
 
 ## Usage
 
 ### Basic Command
 
 ```bash
-madera_pipeline --fastq samples.fastq
+madera --fastq samples.fastq
 ```
 
 ### Common Options
 
 ```bash
 # Process with automatic epsilon determination
-madera_pipeline --fastq samples.fastq --auto_epsilon
+madera --fastq samples.fastq --auto_epsilon
 
 # Launch interactive dashboard
-madera_pipeline --fastq samples.fastq --dashboard
+madera --fastq samples.fastq --dashboard
 
 # Adjust sensitivity for short reads
-madera_pipeline --fastq samples.fastq --min_length 25 --k 3 
+madera --fastq samples.fastq --min_length 25 --k 3 
 ```
 
 ### Full Options Reference
@@ -156,13 +156,13 @@ Provides interactive web-based visualization of:
 
 ```bash
 # Step 1: Process FASTQ file with automatic epsilon detection
-madera_pipeline --fastq ancient_sample.fastq --auto_epsilon --min_length 35 --k 4
+madera --fastq ancient_sample.fastq --auto_epsilon --min_length 35 --k 4
 
 # Step 2: Review the cluster report
 cat cluster_report.csv
 
 # Step 3: Launch interactive dashboard to explore results
-madera_pipeline --fastq ancient_sample.fastq --dashboard --auto_epsilon
+madera --fastq ancient_sample.fastq --dashboard --auto_epsilon
 ```
 
 ## Dashboard Features
@@ -204,7 +204,7 @@ If you use MADERA in your research, please cite:
 
 ```
 Author, A. (2025). MADERA: Metagenomic Ancient DNA Evaluation and Reference-free Analysis. 
-GitHub repository: https://github.com/username/madera_pipeline
+GitHub repository: https://github.com/username/MADERA
 ```
 
 ## Acknowledgments
