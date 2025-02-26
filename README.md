@@ -50,7 +50,7 @@ Key features:
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/username/madera_pipeline.git
+   git clone https://github.com/michi-sxc/MADERA.git
    cd madera_pipeline
    ```
 
