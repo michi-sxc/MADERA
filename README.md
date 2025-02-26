@@ -19,12 +19,53 @@ Key features:
 
 ## Installation
 
-### Prerequisites
+### Option 1: Pre-compiled Binaries
+
+1. Download the appropriate binary for your platform from the [Releases](https://github.com/username/madera_pipeline/releases) page
+
+2. Extract the archive:
+   ```bash
+   # Linux/macOS
+   unzip madera_pipeline-linux-amd64.zip
+   chmod +x madera_pipeline
+   ```
+
+3. Install required dependencies:
+   - **Linux**: `sudo apt-get install libopenblas-dev`
+   - **macOS**: `brew install openblas`
+
+4. Move the binary to a location in your PATH (optional):
+   ```bash
+   # Linux/macOS
+   sudo mv madera_pipeline /usr/local/bin/
+   ```
+
+### Option 2: Docker Container
+
+1. Pull the Docker image:
+   ```bash
+   docker pull username/madera_pipeline:latest
+   ```
+
+2. Run MADERA with Docker:
+   ```bash
+   docker run -v $(pwd):/data username/madera_pipeline --fastq /data/samples.fastq --output /data/results.csv
+   ```
+
+3. For the interactive dashboard:
+   ```bash
+   docker run -v $(pwd):/data -p 8080:8080 username/madera_pipeline --fastq /data/samples.fastq --dashboard
+   ```
+   Then access the dashboard at http://localhost:8080
+
+### Option 3: Build from Source
+
+#### Prerequisites
 
 - Rust (latest stable version)
 - OpenBLAS (for linear algebra operations)
 
-### Steps
+#### Steps
 
 1. Clone the repository:
    ```bash
@@ -38,8 +79,6 @@ Key features:
    ```
 
 3. The binary will be available at `target/release/madera_pipeline`
-
-   Or use the pre-compiled binary at 'releases'
 
 ## Usage
 
@@ -164,8 +203,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 If you use MADERA in your research, please cite:
 
 ```
-Schneider, M. (2025). MADERA: Metagenomic Ancient DNA Evaluation and Reference-free Analysis. 
-GitHub repository: https://github.com/michi-sxc/MADERA
+Author, A. (2025). MADERA: Metagenomic Ancient DNA Evaluation and Reference-free Analysis. 
+GitHub repository: https://github.com/username/madera_pipeline
 ```
 
 ## Acknowledgments
