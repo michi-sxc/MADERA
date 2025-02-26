@@ -27,7 +27,7 @@ Key features:
    ```bash
    # Linux/macOS
    unzip madera_pipeline-linux-amd64.zip
-   chmod +x madera_pipeline
+   chmod +x madera
    ```
 
 3. Install required dependencies:
