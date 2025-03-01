@@ -4321,7 +4321,7 @@ fn display_banner() {
              
                                         
 Metagenomic Ancient DNA Evaluation and Reference-free Analysis
-version 0.2.0
+version 0.3.0
 "#);
     println!("An advanced pipeline for ancient DNA quality control, damage pattern analysis,");
     println!("clustering, and taxonomic assignment without requiring reference genomes.");
@@ -4340,12 +4340,12 @@ version 0.2.0
 /// Setup the help menu and command line arguments
 fn setup_cli() -> Command {
     Command::new("MADERA")
-        .version("0.2.0")
+        .version("0.3.0")
         .about(format!("{}\n{}",
             "MADERA Pipeline: Metagenomic Ancient DNA Evaluation and Reference-free Analysis".bright_green().bold(),
             "An advanced tool for ancient DNA quality control and clustering analysis".cyan()
         ))
-        .author("MADERA Development Team <contact@example.org>")
+        .author("Michael Schneider <michi.schneider123@outlook.de>")
         .arg(
             Arg::new("fastq")
                 .long("fastq")
