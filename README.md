@@ -16,6 +16,7 @@ Key features:
 - **Feature-based clustering**: Combines k-mer frequencies, GC content, codon usage, and damage scores
 - **Interactive visualization**: Web-based dashboard for exploring clustering results
 - **Automated parameter optimization**: Includes methods for automatic parameter selection
+- **Cluster exporting**: Export clustered reads to their own sequence files
 
 ## Installation
 
@@ -101,6 +102,11 @@ madera --fastq samples.fastq --min_length 25 --k 3
 | `--damage_threshold` | Damage threshold for authenticity | 0.5 |
 | `--use_codon` | Include codon usage features | false |
 | `--batch_size` | Batch size for incremental PCA | 1000 |
+| `--export-clusters` | Export sequence clusters to new files | false |
+| `--export-min-size` | Minimum cluster size to export | 0 |
+| `--export-format` | Export format (same=original format, fasta=convert to FASTA) | same |
+| `--export-output` | Output filename for exported clusters | exported_clusters.zip |
+| `--export-with-metadata` | Include cluster metadata in exported files | 1000 |
 
 ## Pipeline Components
 
@@ -124,7 +130,7 @@ Uses DBSCAN (Density-Based Spatial Clustering of Applications with Noise) with o
 Quantifies characteristic ancient DNA damage patterns to assign authenticity scores to clusters.
 
 ### 6. Taxonomic Assignment
-Assigns preliminary taxonomic classifications based on cluster characteristics, primarily using GC content and damage profiles.
+Assigns preliminary taxonomic classifications based on cluster characteristics, primarily using GC content and damage profiles. (Rudimentary placeholder implementation)
 
 ### 7. Visualization Dashboard
 Provides interactive web-based visualization of:
@@ -184,8 +190,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 If you use MADERA in your research, please cite:
 
 ```
-Author, A. (2025). MADERA: Metagenomic Ancient DNA Evaluation and Reference-free Analysis. 
-GitHub repository: https://github.com/username/MADERA
+Schneider, M. (2025). MADERA: Metagenomic Ancient DNA Evaluation and Reference-free Analysis. 
+GitHub repository: https://github.com/michi-sxc/MADERA
 ```
 
 ## Acknowledgments
