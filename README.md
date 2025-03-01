@@ -9,7 +9,7 @@ Metagenomic Ancient DNA Evaluation and Reference-free Analysis (MADERA) is a com
 
 ## Overview
 
-Ancient DNA datasets present unique challenges: fragmented genetic material, damage patterns, and environmental contamination. MADERA analyzes these sequences using intrinsic properties (k-mer frequencies, GC content, damage patterns) to cluster reads and identify taxonomic origins without needing closely related reference genomes.
+MADERA processes ancient DNA datasets by analyzing intrinsic sequence properties (k-mer frequencies, GC content, damage patterns) to cluster reads and determine taxonomic origins without requiring reference genomes. This approach addresses core challenges in paleogenomics: DNA fragmentation, nucleotide modifications, and sample contamination.
 
 Key features:
 
