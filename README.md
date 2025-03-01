@@ -196,5 +196,4 @@ GitHub repository: https://github.com/michi-sxc/MADERA
 
 ## Acknowledgments
 
-- Inspired by challenges in ancient metagenomic analysis
-- Built with Rust and scientific computing libraries
+- Inspired by existing damage assessment tools like PyDamage, PMDtools, mapDamage
