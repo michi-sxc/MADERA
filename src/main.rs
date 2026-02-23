@@ -7,7 +7,7 @@
 //! Michael Schneider 2025
 //! https://github.com/michi-sxc/MADERA
 //! 
-//! v0.3.0
+//! v0.3.1
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use env_logger;
@@ -199,7 +199,7 @@ struct ClusterStat {
     taxonomy: String,
 }
 
-/// Export clusters to sequence files based on export settings (v0.3.0)
+/// Export clusters to sequence files based on export settings (v0.3.1)
 fn export_clusters(
     reads: &[Read],
     clusters: &[isize],
@@ -745,6 +745,638 @@ fn compute_gc_content(seq: &str) -> f64 {
     gc_count as f64 / seq.len() as f64
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// Optimized damage assessment with adaptive algorithm selection
+pub fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageScore> {
+    use rayon::prelude::*;
+    use std::sync::Mutex;
+    use indicatif::{ProgressBar, ProgressStyle};
+    
+    let total_reads = reads.len();
+    let pb = ProgressBar::new(total_reads as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} reads processed (Damage assessment)"
+        )
+        .unwrap()
+        .progress_chars("##-")
+    );
+    
+    // Thread-local storage for temp data to reduce allocation
+    thread_local! {
+        static LOCAL_BUFFER: std::cell::RefCell<Vec<(usize, f64)>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    }
+    
+    // Pre-allocate result map
+    let damage_scores = Mutex::new(HashMap::with_capacity(total_reads));
+    
+    // Process in parallel chunks with adaptive algorithm selection
+    let chunk_size = std::cmp::max(1, total_reads / rayon::current_num_threads());
+    
+    reads.par_chunks(chunk_size).for_each(|chunk| {
+        let mut local_scores = HashMap::with_capacity(chunk.len());
+        
+        for read in chunk {
+            // Fast path for very short reads
+            if read.seq.len() < 15 {
+                local_scores.insert(read.id.clone(), DamageScore {
+                    damage5: 0.1,
+                    damage3: 0.1,
+                    combined: 0.1,
+                });
+                continue;
+            }
+            
+            // Heuristic: If read length >= 100, use estimation-based approach
+            let damage = if read.seq.len() >= 100 {
+                compute_damage_score_fast(read, window_size)
+            } else {
+                // For shorter reads, use full algorithm
+                compute_damage_score_accurate(read, window_size)
+            };
+            
+            local_scores.insert(read.id.clone(), damage);
+        }
+        
+        // Update the global scores
+        let mut scores = damage_scores.lock().unwrap();
+        scores.extend(local_scores);
+        
+        pb.inc(chunk.len() as u64);
+    });
+    
+    pb.finish_with_message("Damage assessment complete");
+    
+    damage_scores.into_inner().unwrap()
+}
+
+/// Fast damage assessment for longer reads using approximation methods
+fn compute_damage_score_fast(read: &Read, window_size: usize) -> DamageScore {
+    let seq = &read.seq;
+    let seq_len = seq.len();
+    
+    // Extract 5' and 3' ends for analysis
+    let max_window = std::cmp::min(window_size * 3, seq_len / 4);
+    let five_prime = &seq[0..std::cmp::min(max_window, seq_len / 2)];
+    let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(max_window, seq_len / 2))..];
+    
+    // Fast frequency analysis instead of change point detection
+    let (t_count_5p, c_count_5p) = count_tc_bases(five_prime);
+    let (a_count_3p, g_count_3p) = count_ag_bases(three_prime);
+    
+    // Calculate damage signatures
+    let five_prime_score = if c_count_5p > 0 {
+        (t_count_5p as f64 / (t_count_5p + c_count_5p) as f64).min(0.8)
+    } else {
+        0.2 // Default when no C bases
+    };
+    
+    let three_prime_score = if g_count_3p > 0 {
+        (a_count_3p as f64 / (a_count_3p + g_count_3p) as f64).min(0.8)
+    } else {
+        0.2 // Default when no G bases
+    };
+    
+    // Position-weighted scoring
+    let pos_weighted_5p = position_weighted_score(five_prime, 't', 'c', true);
+    let pos_weighted_3p = position_weighted_score(three_prime, 'a', 'g', false);
+    
+    // Combined score using weighted average
+    let damage5 = 0.7 * five_prime_score + 0.3 * pos_weighted_5p;
+    let damage3 = 0.7 * three_prime_score + 0.3 * pos_weighted_3p;
+    
+    // Length-based authenticity factor
+    let length_factor = if seq_len < 50 { 0.9 }
+                    else if seq_len < 100 { 0.7 }
+                    else if seq_len < 150 { 0.5 }
+                    else if seq_len < 200 { 0.3 }
+                    else { 0.1 };
+    
+    // Calculate balance factor (authentic aDNA typically shows both 5' and 3' damage)
+    let balance_factor = if damage5 > 0.2 && damage3 > 0.2 {
+        1.0 - (damage5 - damage3).abs() / (damage5 + damage3).max(0.1)
+    } else {
+        0.5
+    };
+    
+    // Authenticity score with multiple factors
+    let combined = 0.4 * ((damage5 + damage3) / 2.0) + 
+                   0.35 * length_factor +
+                   0.25 * balance_factor;
+    
+    DamageScore {
+        damage5,
+        damage3,
+        combined,
+    }
+}
+
+/// Position-weighted scoring for damage patterns
+fn position_weighted_score(segment: &str, target: char, _source: char, is_five_prime: bool) -> f64 {
+    let chars: Vec<char> = segment.chars().collect();
+    let len = chars.len();
+    if len < 3 { return 0.2; }
+    
+    let mut score = 0.0;
+    let mut total_weight = 0.0;
+    
+    for (i, &base) in chars.iter().enumerate() {
+        // Skip non-target bases
+        if base.to_ascii_lowercase() != target { continue; }
+        
+        // Position weight is higher closer to ends
+        let position_weight = if is_five_prime {
+            // Exponential decay from start (5' end)
+            (-0.3 * i as f64).exp()
+        } else {
+            // Exponential decay from end (3' end)
+            (-0.3 * (len - i - 1) as f64).exp()
+        };
+        
+        // Context weight (surrounding bases influence damage likelihood)
+        let context_weight = if i > 0 && i < len - 1 {
+            let prev = chars[i-1].to_ascii_lowercase();
+            let next = chars[i+1].to_ascii_lowercase();
+            
+            if is_five_prime && next == 'g' {
+                1.5 // CpG context (higher deamination rate)
+            } else if !is_five_prime && prev == 'c' {
+                1.5 // CpG context
+            } else if prev == 'g' || prev == 'c' || next == 'g' || next == 'c' {
+                1.2 // GC-rich context
+            } else {
+                1.0 // Standard context
+            }
+        } else {
+            1.0
+        };
+        
+        score += position_weight * context_weight;
+        total_weight += position_weight;
+    }
+    
+    // Normalize score
+    if total_weight > 0.0 {
+        (score / total_weight).min(1.0)
+    } else {
+        0.2 // Default score when no target bases found
+    }
+}
+
+/// Count T and C bases in a sequence
+fn count_tc_bases(segment: &str) -> (usize, usize) {
+    let mut t_count = 0;
+    let mut c_count = 0;
+    
+    for c in segment.chars() {
+        match c.to_ascii_uppercase() {
+            'T' => t_count += 1,
+            'C' => c_count += 1,
+            _ => {}
+        }
+    }
+    
+    (t_count, c_count)
+}
+
+/// Count A and G bases in a sequence
+fn count_ag_bases(segment: &str) -> (usize, usize) {
+    let mut a_count = 0;
+    let mut g_count = 0;
+    
+    for c in segment.chars() {
+        match c.to_ascii_uppercase() {
+            'A' => a_count += 1,
+            'G' => g_count += 1,
+            _ => {}
+        }
+    }
+    
+    (a_count, g_count)
+}
+
+/// Accurate method for smaller reads (similar to original but optimized)
+fn compute_damage_score_accurate(read: &Read, window_size: usize) -> DamageScore {
+    // Use thread-local storage for temporary data
+    thread_local! {
+        static FIVE_FREQS: std::cell::RefCell<Vec<[f64; 4]>> = std::cell::RefCell::new(Vec::with_capacity(64));
+        static THREE_FREQS: std::cell::RefCell<Vec<[f64; 4]>> = std::cell::RefCell::new(Vec::with_capacity(64));
+        static DEAM_SITES: std::cell::RefCell<Vec<(usize, f64)>> = std::cell::RefCell::new(Vec::with_capacity(64));
+    }
+    
+    let seq = &read.seq;
+    let seq_len = seq.len();
+    
+    // Early exit for very short reads
+    if seq_len < 15 {
+        return DamageScore {
+            damage5: 0.1,
+            damage3: 0.1,
+            combined: 0.1,
+        };
+    }
+    
+    // Define window sizes adaptively based on read length
+    let max_window = std::cmp::min(window_size * 3, seq_len / 4);
+    
+    // Extract sequence segments for analysis
+    let five_prime = &seq[0..std::cmp::min(max_window, seq_len / 2)];
+    let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(max_window, seq_len / 2))..];
+    
+    // Quick check for damage signatures
+    let (t_count_5p, c_count_5p) = count_tc_bases(five_prime);
+    let (a_count_3p, g_count_3p) = count_ag_bases(three_prime);
+    
+    // If there's very little potential for damage, use fast path
+    if (t_count_5p + c_count_5p < 5) || (a_count_3p + g_count_3p < 5) {
+        return compute_damage_score_fast(read, window_size);
+    }
+    
+    // Calculate optimized change point detection
+    let cp5 = FIVE_FREQS.with(|freqs| {
+        let mut freqs_vec = freqs.borrow_mut();
+        freqs_vec.clear();
+        
+        // Collect frequencies more efficiently
+        collect_position_frequencies(five_prime, true, &mut freqs_vec);
+        
+        // Find change point with optimized algorithm 
+        find_optimized_change_point(&freqs_vec, 'T', 'C')
+    });
+    
+    let cp3 = THREE_FREQS.with(|freqs| {
+        let mut freqs_vec = freqs.borrow_mut();
+        freqs_vec.clear();
+        
+        // Collect frequencies more efficiently
+        collect_position_frequencies(three_prime, false, &mut freqs_vec);
+        
+        // Find change point with optimized algorithm
+        find_optimized_change_point(&freqs_vec, 'A', 'G')
+    });
+    
+    // Calculate change point scores
+    let cp5_score = calculate_change_point_score(&FIVE_FREQS.with(|f| f.borrow().clone()), cp5.position);
+    let cp3_score = calculate_change_point_score(&THREE_FREQS.with(|f| f.borrow().clone()), cp3.position);
+    
+    // Apply optimized decay model with binary search
+    let decay5 = DEAM_SITES.with(|sites| {
+        let mut sites_vec = sites.borrow_mut();
+        sites_vec.clear();
+        
+        identify_potential_deamination(five_prime, true, &mut sites_vec);
+        fit_optimized_decay_model(&sites_vec)
+    });
+    
+    let decay3 = DEAM_SITES.with(|sites| {
+        let mut sites_vec = sites.borrow_mut();
+        sites_vec.clear();
+        
+        identify_potential_deamination(three_prime, false, &mut sites_vec);
+        fit_optimized_decay_model(&sites_vec)
+    });
+    
+    // Calculate final scores
+    let damage5 = 0.6 * cp5_score + 0.4 * decay5.fit_quality;
+    let damage3 = 0.6 * cp3_score + 0.4 * decay3.fit_quality;
+    
+    // Calculate authenticity score based on multiple factors
+    let length_factor = if seq_len < 50 { 0.9 }
+                    else if seq_len < 100 { 0.7 }
+                    else if seq_len < 150 { 0.5 }
+                    else if seq_len < 200 { 0.3 }
+                    else { 0.1 };
+    
+    let balance_factor = if damage5 > 0.2 && damage3 > 0.2 {
+        1.0 - (damage5 - damage3).abs() / (damage5 + damage3).max(0.1)
+    } else {
+        0.5
+    };
+    
+    let combined = 0.4 * ((damage5 + damage3) / 2.0) + 
+                   0.35 * length_factor +
+                   0.25 * balance_factor;
+    
+    DamageScore {
+        damage5,
+        damage3,
+        combined,
+    }
+}
+
+/// More efficient position frequency collection
+fn collect_position_frequencies(segment: &str, _is_five_prime: bool, freqs: &mut Vec<[f64; 4]>) {
+    let len = segment.len();
+    freqs.resize(len, [0.0; 4]);
+    
+    for (i, c) in segment.chars().enumerate() {
+        let idx = match c.to_ascii_uppercase() {
+            'A' => 0,
+            'C' => 1,
+            'G' => 2,
+            'T' => 3,
+            _ => continue, // Skip non-ACGT bases
+        };
+        
+        freqs[i][idx] = 1.0;
+    }
+}
+
+/// Optimized change point detection
+fn find_optimized_change_point(position_freqs: &Vec<[f64; 4]>, target_base_char: char, _source_base_char: char) -> ChangePointResult {
+    let target_base = base_to_index(target_base_char);
+    let num_positions = position_freqs.len();
+    
+    if num_positions < 6 {
+        return ChangePointResult {
+            position: None,
+            pvalue: 1.0,
+        };
+    }
+    
+    // Pre-compute cumulative sums in one pass
+    let mut cumul_target = vec![0.0; num_positions + 1];
+    let mut cumul_total = vec![0.0; num_positions + 1];
+    
+    for i in 0..num_positions {
+        cumul_target[i+1] = cumul_target[i] + position_freqs[i][target_base];
+        cumul_total[i+1] = cumul_total[i] + 1.0;
+    }
+    
+    // Use divide and conquer to find optimal change point
+    let (max_statistic, change_pos) = find_optimal_split(&cumul_target, &cumul_total, 2, num_positions - 2);
+    
+    // Calculate background rate once
+    let background_start = std::cmp::min(6, num_positions / 2);
+    let background_end = num_positions;
+    let background_count = cumul_target[background_end] - cumul_target[background_start];
+    let background_total = cumul_total[background_end] - cumul_total[background_start];
+    let background_rate = if background_total > 0.0 {
+        background_count / background_total
+    } else {
+        0.25
+    };
+    
+    // Calculate p-value
+    let pvalue = if max_statistic > 0.0 {
+        let z_score = max_statistic / background_rate.sqrt();
+        approximate_pvalue(z_score)
+    } else {
+        1.0
+    };
+    
+    ChangePointResult {
+        position: change_pos,
+        pvalue,
+    }
+}
+
+/// Find optimal split point using divide and conquer
+fn find_optimal_split(cumul_target: &[f64], cumul_total: &[f64], start: usize, end: usize) -> (f64, Option<usize>) {
+    if end <= start + 1 {
+        return (0.0, None);
+    }
+    
+    let mut max_statistic = 0.0;
+    let mut best_pos = None;
+    
+    // Base case - check all positions in this range
+    if end - start <= 16 {
+        for k in start..end {
+            let n1 = cumul_total[k] - cumul_total[0];
+            let n2 = cumul_total[cumul_total.len() - 1] - cumul_total[k];
+            
+            if n1 < 3.0 || n2 < 3.0 {
+                continue;
+            }
+            
+            let count1 = cumul_target[k] - cumul_target[0];
+            let count2 = cumul_target[cumul_total.len() - 1] - cumul_target[k];
+            
+            let p1 = count1 / n1;
+            let p2 = count2 / n2;
+            
+            let statistic = (p1 - p2).abs() * (n1 * n2 / (n1 + n2)).sqrt();
+            
+            if statistic > max_statistic {
+                max_statistic = statistic;
+                best_pos = Some(k);
+            }
+        }
+        
+        return (max_statistic, best_pos);
+    }
+    
+    // Divide and conquer
+    let mid = (start + end) / 2;
+    
+    // Check the midpoint
+    let n1 = cumul_total[mid] - cumul_total[0];
+    let n2 = cumul_total[cumul_total.len() - 1] - cumul_total[mid];
+    
+    if n1 >= 3.0 && n2 >= 3.0 {
+        let count1 = cumul_target[mid] - cumul_target[0];
+        let count2 = cumul_target[cumul_total.len() - 1] - cumul_target[mid];
+        
+        let p1 = count1 / n1;
+        let p2 = count2 / n2;
+        
+        let statistic = (p1 - p2).abs() * (n1 * n2 / (n1 + n2)).sqrt();
+        
+        if statistic > max_statistic {
+            max_statistic = statistic;
+            best_pos = Some(mid);
+        }
+    }
+    
+    // Recurse on both halves
+    let (left_stat, left_pos) = find_optimal_split(cumul_target, cumul_total, start, mid);
+    if left_stat > max_statistic {
+        max_statistic = left_stat;
+        best_pos = left_pos;
+    }
+    
+    let (right_stat, right_pos) = find_optimal_split(cumul_target, cumul_total, mid, end);
+    if right_stat > max_statistic {
+        max_statistic = right_stat;
+        best_pos = right_pos;
+    }
+    
+    (max_statistic, best_pos)
+}
+
+/// Optimized potential deamination identification
+fn identify_potential_deamination(segment: &str, is_five_prime: bool, deam_sites: &mut Vec<(usize, f64)>) {
+    deam_sites.clear();
+    let bases: Vec<char> = segment.chars().collect();
+    
+    for (i, &base) in bases.iter().enumerate() {
+        let (damage_prob, is_deaminated) = if is_five_prime {
+            match base.to_ascii_uppercase() {
+                'T' => {
+                    // Context-based probability using lookup instead of function calls
+                    let prob = if i + 1 < bases.len() && bases[i + 1].to_ascii_uppercase() == 'G' {
+                        0.85 // CpG context - highest deamination rate
+                    } else if i < 3 {
+                        0.75 // Near 5' end - high probability
+                    } else if i < 6 {
+                        0.65 // Still near 5' end but further away
+                    } else {
+                        0.5  // Further from end
+                    };
+                    (prob, true)
+                },
+                'C' => (0.1, false),
+                _ => (0.0, false),
+            }
+        } else {
+            match base.to_ascii_uppercase() {
+                'A' => {
+                    // Context-based probability with direct lookup
+                    let prob = if i > 0 && bases[i - 1].to_ascii_uppercase() == 'C' {
+                        0.8 // CpG context
+                    } else {
+                        let distance_from_end = bases.len().saturating_sub(i + 1);
+                        if distance_from_end == 0 {
+                            0.75 // Terminal position
+                        } else if distance_from_end < 3 {
+                            0.65 // Near 3' end
+                        } else if distance_from_end < 6 {
+                            0.55
+                        } else {
+                            0.45
+                        }
+                    };
+                    (prob, true)
+                },
+                'G' => {
+                    let distance_from_end = bases.len().saturating_sub(i + 1);
+                    let prob = if i > 0 && bases[i - 1].to_ascii_uppercase() == 'C' {
+                        0.18 // CpG context
+                    } else if distance_from_end < 3 {
+                        0.14 // Near 3' end
+                    } else {
+                        0.07
+                    };
+                    (prob, false)
+                },
+                _ => (0.0, false),
+            }
+        };
+        
+        if is_deaminated || damage_prob > 0.0 {
+            deam_sites.push((i, damage_prob));
+        }
+    }
+}
+
+/// Optimized exponential decay model fitting using binary search
+fn fit_optimized_decay_model(deam_sites: &[(usize, f64)]) -> ExponentialModel {
+    if deam_sites.len() < 3 {
+        return ExponentialModel {
+            lambda: 0.0,
+            amplitude: 0.0,
+            fit_quality: 0.0,
+        };
+    }
+    
+    // Binary search for optimal lambda instead of testing 50 values
+    let mut left = 0.01;
+    let mut right = 2.0;
+    let mut best_lambda = 0.0;
+    let mut best_amplitude = 0.0;
+    let mut best_fit = 0.0;
+    
+    // Only 8 iterations needed for binary search vs 50 for linear search
+    for _ in 0..8 {
+        let mid1 = left + (right - left) / 3.0;
+        let mid2 = right - (right - left) / 3.0;
+        
+        let deam_sites_f64: Vec<(f64, f64)> = deam_sites.iter().map(|&(pos, prob)| (pos as f64, prob)).collect();
+        let (amp1, fit1) = test_exponential_fit(&deam_sites_f64, mid1);
+        let deam_sites_f64: Vec<(f64, f64)> = deam_sites.iter().map(|&(pos, prob)| (pos as f64, prob)).collect();
+        let (amp2, fit2) = test_exponential_fit(&deam_sites_f64, mid2);
+        
+        if fit1 > fit2 {
+            right = mid2;
+            if fit1 > best_fit {
+                best_fit = fit1;
+                best_lambda = mid1;
+                best_amplitude = amp1;
+            }
+        } else {
+            left = mid1;
+            if fit2 > best_fit {
+                best_fit = fit2;
+                best_lambda = mid2;
+                best_amplitude = amp2;
+            }
+        }
+    }
+    
+    ExponentialModel {
+        lambda: best_lambda,
+        amplitude: best_amplitude,
+        fit_quality: best_fit,
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /// Calculate damage scores for ancient DNA reads
 fn damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageScore> {
     use rayon::prelude::*;
@@ -956,13 +1588,15 @@ fn detect_damage_change_points(read: &Read, window_size: usize) -> ChangePointRe
     let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(window_size, seq_len / 2))..];
     
     // Collect base frequencies at each position
-    let five_freqs = collect_position_frequencies(five_prime, true);
-    let three_freqs = collect_position_frequencies(three_prime, false);
-    
+    let mut five_freqs = Vec::new();
+    collect_position_frequencies(five_prime, true, &mut five_freqs);
+    let mut three_freqs = Vec::new();
+    collect_position_frequencies(three_prime, false, &mut three_freqs);
+
     // Run change point detection algorithm
-    let five_change = find_change_point(&five_freqs, 'T', 'C');
-    let three_change = find_change_point(&three_freqs, 'A', 'G');
-    
+    let five_change = find_optimized_change_point(&five_freqs, 'T', 'C');
+    let three_change = find_optimized_change_point(&three_freqs, 'A', 'G');
+
     // Return results
     ChangePointResults {
         prime5_pvalue: five_change.pvalue,
@@ -972,103 +1606,8 @@ fn detect_damage_change_points(read: &Read, window_size: usize) -> ChangePointRe
     }
 }
 
-/// Collect frequency of each base at each position
-fn collect_position_frequencies(segment: &str, _is_five_prime: bool) -> Vec<[f64; 4]> {
-    let len = segment.len();
-    let mut freqs = vec![[0.0; 4]; len]; // [A, C, G, T] at each position
-    
-    let bases = segment.chars().collect::<Vec<_>>();
-    
-    for (i, base) in bases.iter().enumerate() {
-        let idx = match base.to_ascii_uppercase() {
-            'A' => 0,
-            'C' => 1,
-            'G' => 2,
-            'T' => 3,
-            _ => continue, // Skip non-ACGT bases
-        };
-        
-        // We're analyzing just one read, so frequency is either 0 or 1
-        freqs[i][idx] = 1.0;
-    }
-    
-    freqs
-}
-
-/// Find the point where base frequencies significantly change
-/// Using a statistical change point detection algorithm
-fn find_change_point(position_freqs: &Vec<[f64; 4]>, target_base_char: char, _source_base_char: char) -> ChangePointResult {
-    let target_base = base_to_index(target_base_char);
-    let num_positions = position_freqs.len();
-    
-    if num_positions < 6 {
-        return ChangePointResult {
-            position: None,
-            pvalue: 1.0,
-        };
-    }
-    
-    // Compute cumulative frequencies
-    let mut cumul_target = vec![0.0; num_positions + 1];
-    let mut cumul_total = vec![0.0; num_positions + 1];
-    
-    for i in 0..num_positions {
-        cumul_target[i+1] = cumul_target[i] + position_freqs[i][target_base];
-        cumul_total[i+1] = cumul_total[i] + 1.0; // Each position has one base
-    }
-    
-    // Find the position with maximum CUSUM statistic
-    let mut max_statistic = 0.0;
-    let mut change_pos = None;
-    
-    // Calculate background rate (from positions far from end)
-    let background_start = std::cmp::min(6, num_positions / 2);
-    let background_end = num_positions;
-    let background_count = cumul_target[background_end] - cumul_target[background_start];
-    let background_total = cumul_total[background_end] - cumul_total[background_start];
-    let background_rate = if background_total > 0.0 {
-        background_count / background_total
-    } else {
-        0.25 // Default to uniform distribution
-    };
-    
-    // Binary segmentation to find the change point
-    for k in 2..(num_positions - 2) {
-        let n1 = cumul_total[k] - cumul_total[0];
-        let n2 = cumul_total[num_positions] - cumul_total[k];
-        
-        if n1 < 3.0 || n2 < 3.0 {
-            continue; // Need at least 3 positions for statistics
-        }
-        
-        let count1 = cumul_target[k] - cumul_target[0];
-        let count2 = cumul_target[num_positions] - cumul_target[k];
-        
-        let p1 = count1 / n1;
-        let p2 = count2 / n2;
-        
-        // Calculate CUSUM statistic
-        let statistic = (p1 - p2).abs() * (n1 * n2 / (n1 + n2)).sqrt();
-        
-        if statistic > max_statistic {
-            max_statistic = statistic;
-            change_pos = Some(k);
-        }
-    }
-    
-    // Calculate p-value using bootstrap method
-    let pvalue = if max_statistic > 0.0 {
-        let z_score = max_statistic / background_rate.sqrt();
-        approximate_pvalue(z_score)
-    } else {
-        1.0
-    };
-    
-    ChangePointResult {
-        position: change_pos,
-        pvalue,
-    }
-}
+// Duplicate collect_position_frequencies and find_change_point removed in v0.3.1
+// Using the optimized versions (collect_position_frequencies 3-arg and find_optimized_change_point)
 
 /// Convert base character to array index
 fn base_to_index(base: char) -> usize {
@@ -1146,12 +1685,32 @@ fn fit_decay_damage_model(read: &Read, window_size: usize) -> DecayModelResults 
     let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(window_size, seq_len / 2))..];
     
     // Determine if bases are potential deaminated sites
-    let five_deam = identify_potential_deamination(five_prime, true);
-    let three_deam = identify_potential_deamination(three_prime, false);
+    let mut five_deam = Vec::new();
+    identify_potential_deamination(five_prime, true, &mut five_deam);
+    let mut three_deam = Vec::new();
+    identify_potential_deamination(three_prime, false, &mut three_deam);
     
     // Fit exponential decay model to observed damage patterns
-    let five_model = fit_exponential_model(&five_deam);
-    let three_model = fit_exponential_model(&three_deam);
+    // Convert usize positions to f64 before passing to test_exponential_fit
+    let five_deam_f64: Vec<(f64, f64)> = five_deam.iter().map(|&(pos, prob)| (pos as f64, prob)).collect();
+    let best_lambda = optimize_lambda(&five_deam_f64);
+    let (best_amplitude, best_fit) = test_exponential_fit(&five_deam_f64, best_lambda);
+    
+    let five_model = ExponentialModel {
+        lambda: best_lambda,
+        amplitude: best_amplitude,
+        fit_quality: best_fit,
+    };
+    
+    let three_deam_f64: Vec<(f64, f64)> = three_deam.iter().map(|&(pos, prob)| (pos as f64, prob)).collect();
+    let best_lambda = optimize_lambda(&three_deam_f64);
+    let (best_amplitude, best_fit) = test_exponential_fit(&three_deam_f64, best_lambda);
+    
+    let three_model = ExponentialModel {
+        lambda: best_lambda,
+        amplitude: best_amplitude,
+        fit_quality: best_fit,
+    };
     
     // Calculate log-likelihood ratio (damage model vs. uniform model)
     let llr = calculate_log_likelihood_ratio(&five_deam, &three_deam, &five_model, &three_model);
@@ -1165,200 +1724,36 @@ fn fit_decay_damage_model(read: &Read, window_size: usize) -> DecayModelResults 
     }
 }
 
-/// Identify positions that may have undergone deamination
-fn identify_potential_deamination(segment: &str, is_five_prime: bool) -> Vec<(usize, f64)> {
-    let mut deam_sites = Vec::new();
-    let bases = segment.chars().collect::<Vec<_>>();
+// Duplicate identify_potential_deamination (2-arg), analyze_five_prime_context,
+// analyze_three_prime_context, analyze_c_susceptibility, analyze_g_susceptibility,
+// and fit_exponential_model removed in v0.3.1
+// Using the optimized 3-arg identify_potential_deamination and fit_optimized_decay_model
+
+/// Optimize lambda parameter using binary search
+fn optimize_lambda(pos_probs: &[(f64, f64)]) -> f64 {
+    let mut lower = 0.05;
+    let mut upper = 2.5;
     
-    for (i, &base) in bases.iter().enumerate() {
-        let (damage_prob, is_deaminated) = if is_five_prime {
-            // 5' end: Look for C→T transitions
-            match base.to_ascii_uppercase() {
-                'T' => {
-                    // Context analysis
-                    let (_, prob) = analyze_five_prime_context(i, &bases);
-                    (prob, true)
-                },
-                'C' => (0.1, false), // C that could deaminate but hasn't
-                _ => (0.0, false),   // Other bases not relevant
-            }
+    while upper - lower > 0.01 {
+        let mid = (lower + upper) / 2.0;
+        let (_, fit_mid) = test_exponential_fit(pos_probs, mid);
+        
+        let left = mid - 0.05;
+        let right = mid + 0.05;
+        let (_, fit_left) = test_exponential_fit(pos_probs, left);
+        let (_, fit_right) = test_exponential_fit(pos_probs, right);
+        
+        if fit_left > fit_mid {
+            upper = mid;
+        } else if fit_right > fit_mid {
+            lower = mid;
         } else {
-            // 3' end: Look for G→A transitions
-            match base.to_ascii_uppercase() {
-                'A' => {
-                    // A could be a deaminated G
-                    // Context analysis for 3' end
-                    let (_, prob) = analyze_three_prime_context(i, &bases);
-                    (prob, true)
-                },
-                'G' => {
-                    // G that could deaminate but hasn't yet
-                    // Susceptibility analysis
-                    let (_, prob) = analyze_g_susceptibility(i, &bases);
-                    (prob, false)
-                },
-                _ => (0.0, false),   // Other bases not relevant
-            }
-        };
-        
-        if is_deaminated || damage_prob > 0.0 {
-            deam_sites.push((i, damage_prob));
+            // Local maximum found
+            return mid;
         }
     }
     
-    deam_sites
-}
-
-/// Analyze the sequence context at 5' end for more accurate damage assessment
-fn analyze_five_prime_context(pos: usize, bases: &[char]) -> (&'static str, f64) {
-    if pos + 1 >= bases.len() {
-        return ("end", 0.6);
-    }
-    
-    let next_base = bases[pos + 1].to_ascii_uppercase();
-    
-    // CpG has highest deamination rate
-    if next_base == 'G' {
-        ("CpG", 0.85)
-    } 
-    // Check if within GC-rich context (higher deamination propensity)
-    else if pos + 3 < bases.len() {
-        let gc_count = bases[pos+1..pos+4].iter()
-            .filter(|&&b| b.to_ascii_uppercase() == 'G' || b.to_ascii_uppercase() == 'C')
-            .count();
-        
-        if gc_count >= 2 {
-            ("GC-rich", 0.75)
-        } else {
-            ("standard", 0.6)
-        }
-    } else {
-        ("standard", 0.6)
-    }
-}
-
-/// Analyze 3' end context for A that may be deaminated G
-fn analyze_three_prime_context(pos: usize, bases: &[char]) -> (&'static str, f64) {
-    // Distance from 3' end (for weighting)
-    let distance_from_end = bases.len().saturating_sub(pos + 1);
-    
-    // Position factor - damage decreases with distance from end
-    let position_factor = match distance_from_end {
-        0 => 1.0,             // Last base
-        1 => 0.9,             // Second-to-last base
-        2 => 0.8,             // Third-to-last base
-        d if d < 5 => 0.7,    // Positions 3-4 from end
-        d if d < 10 => 0.6,   // Positions 5-9 from end
-        _ => 0.5,             // Further positions
-    };
-    
-    // Terminal position - special case
-    if pos == 0 {
-        return ("terminal", 0.6 * position_factor);
-    }
-    
-    // CpG context check (highest deamination rate)
-    let prev_base = bases[pos - 1].to_ascii_uppercase();
-    if prev_base == 'C' {
-        return ("CpG", 0.8 * position_factor);
-    }
-    
-    // GC content analysis (higher GC = higher deamination rate)
-    if pos >= 3 {
-        let window_size = std::cmp::min(3, pos);
-        let gc_count = bases[pos-window_size..pos].iter()
-            .filter(|&&b| b.to_ascii_uppercase() == 'G' || b.to_ascii_uppercase() == 'C')
-            .count();
-        
-        let gc_ratio = gc_count as f64 / window_size as f64;
-        
-        if gc_ratio > 0.66 {
-            return ("GC-rich", (0.7 * position_factor));
-        } else if gc_ratio > 0.33 {
-            return ("mixed-GC", (0.6 * position_factor));
-        }
-    }
-    
-    // Default context
-    ("standard", 0.55 * position_factor)
-}
-
-/// Analyze C for deamination susceptibility (when it hasn't deaminated yet)
-#[allow(dead_code)]
-fn analyze_c_susceptibility(pos: usize, bases: &[char]) -> (&'static str, f64) {
-    // CpG context check (highest susceptibility)
-    if pos + 1 < bases.len() && bases[pos + 1].to_ascii_uppercase() == 'G' {
-        return ("CpG", 0.2);
-    }
-    
-    // Position from 5' end
-    let position_factor = if pos < 3 {
-        0.15  // Higher susceptibility near 5' end
-    } else if pos < 7 {
-        0.12
-    } else {
-        0.08  // Lower susceptibility further from end
-    };
-    
-    ("standard", position_factor)
-}
-
-/// Analyze G for deamination susceptibility (when it hasn't deaminated yet)
-fn analyze_g_susceptibility(pos: usize, bases: &[char]) -> (&'static str, f64) {
-    // CpG context check (highest susceptibility)
-    if pos > 0 && bases[pos - 1].to_ascii_uppercase() == 'C' {
-        return ("CpG", 0.18);
-    }
-    
-    // Distance from 3' end
-    let distance_from_end = bases.len().saturating_sub(pos + 1);
-    let position_factor = if distance_from_end < 3 {
-        0.14  // Higher susceptibility near 3' end
-    } else if distance_from_end < 7 {
-        0.1
-    } else {
-        0.07  // Lower susceptibility further from end
-    };
-    
-    ("standard", position_factor)
-}
-
-/// Fit an exponential decay model to potential deamination sites
-fn fit_exponential_model(deam_sites: &[(usize, f64)]) -> ExponentialModel {
-    if deam_sites.len() < 3 {
-        return ExponentialModel {
-            lambda: 0.0,
-            amplitude: 0.0,
-            fit_quality: 0.0,
-        };
-    }
-    
-    // Calculate initial estimates based on observed pattern
-    // Lambda controls how quickly damage decreases from end
-    let pos_probs: Vec<(f64, f64)> = deam_sites.iter()
-        .map(|&(pos, prob)| (pos as f64, prob))
-        .collect();
-    
-    // Try a range of lambda values and find the best fit
-    // This is a simplified numerical optimization
-    let mut best_lambda = 0.0;
-    let mut best_amplitude = 0.0;
-    let mut best_fit = 0.0;
-    
-    for lambda_test in (1..50).map(|x| x as f64 * 0.05) {
-        let (amplitude, fit) = test_exponential_fit(&pos_probs, lambda_test);
-        if fit > best_fit {
-            best_fit = fit;
-            best_lambda = lambda_test;
-            best_amplitude = amplitude;
-        }
-    }
-    
-    ExponentialModel {
-        lambda: best_lambda,
-        amplitude: best_amplitude,
-        fit_quality: best_fit,
-    }
+    (lower + upper) / 2.0  // Return average as final estimate
 }
 
 /// Test how well a specific lambda value fits the data
@@ -1808,11 +2203,6 @@ fn parse_read_id(read_id: &str) -> (String, u8) {
 /// Analyze a read using the read pair overlap approach
 /// This is the main entry point for read pair analysis from other parts of the pipeline
 pub fn analyze_read_pair_overlaps(read: &Read) -> ReadPairResults {
-    // Access the global cache
-    lazy_static! {
-        static ref GLOBAL_CACHE: Arc<ReadPairCache> = Arc::new(ReadPairCache::new());
-    }
-    
     // First, add this read to the cache
     let paired = GLOBAL_CACHE.add_read(read);
     
@@ -2438,11 +2828,12 @@ fn incremental_pca(
     n_components: usize
 ) -> (Array1<f64>, Array2<f64>, Vec<f64>, Array2<f64>) {
     use ndarray::{Array1, Array2};
-    use ndarray_linalg::Eig;
+    use ndarray_linalg::Eigh;
+    use ndarray_linalg::UPLO;
     use indicatif::{ProgressBar, ProgressStyle};
     use std::sync::{Arc, Mutex};
     use rayon::prelude::*;
-    
+
     // First, extract features for all reads and filter out any problematic ones
     info!("Extracting features for PCA...");
     let pb = ProgressBar::new(reads.len() as u64);
@@ -2453,14 +2844,14 @@ fn incremental_pca(
         .unwrap()
         .progress_chars("##-")
     );
-    
+
     // Store both the feature vectors and associated read indices
     let feature_vectors = Arc::new(Mutex::new(Vec::new()));
     let chunk_size = std::cmp::max(1, reads.len() / rayon::current_num_threads());
-    
+
     reads.par_chunks(chunk_size).for_each(|chunk| {
         let mut local_features = Vec::with_capacity(chunk.len());
-        
+
         for read in chunk {
             // Try to extract features, skipping reads that cause problems
             let features = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| feature_extractor(read))) {
@@ -2470,30 +2861,30 @@ fn incremental_pca(
                     continue;
                 }
             };
-            
+
             // Verify the feature vector is the correct length
             if features.len() == total_features {
                 local_features.push((read.id.clone(), features));
             }
         }
-        
+
         // Update global features list
         let mut all_features = feature_vectors.lock().unwrap();
         all_features.extend(local_features);
         pb.inc(chunk.len() as u64);
     });
-    
+
     pb.finish_with_message("Feature extraction complete");
-    
+
     // Get the feature vectors and prepare for PCA
     let all_feature_vectors = Arc::try_unwrap(feature_vectors)
         .expect("Failed to unwrap feature vectors Arc")
         .into_inner()
         .expect("Failed to unwrap feature vectors Mutex");
-    
+
     let n_samples = all_feature_vectors.len();
     info!("Successfully extracted features for {} reads", n_samples);
-    
+
     if n_samples == 0 {
         error!("No valid feature vectors extracted. Cannot perform PCA.");
         return (
@@ -2503,14 +2894,8 @@ fn incremental_pca(
             Array2::<f64>::zeros((1, 1))
         );
     }
-    
-    // Initial parameters for PCA
-    let mut mean = Array1::<f64>::zeros(total_features);
-    let mut components = Array2::<f64>::zeros((total_features, total_features));
-    let mut explained_variance = Vec::with_capacity(n_components);
-    let mut n_samples_seen = 0;
-    
-    // Progress bar for the PCA
+
+    // Progress bar for PCA
     let pb = ProgressBar::new(n_samples as u64);
     pb.set_style(
         ProgressStyle::with_template(
@@ -2519,129 +2904,112 @@ fn incremental_pca(
         .unwrap()
         .progress_chars("##-")
     );
-    
+
     // Convert feature vectors to a data matrix
     let mut data_matrix = Array2::<f64>::zeros((n_samples, total_features));
     let mut read_ids = Vec::with_capacity(n_samples);
-    
+
     for (i, (id, features)) in all_feature_vectors.iter().enumerate() {
         read_ids.push(id.clone());
         for (j, &val) in features.iter().enumerate() {
             data_matrix[[i, j]] = val;
         }
     }
-    
-    // Process in batches
+
+    // Incremental PCA with proper covariance update (Ross et al. 2008)
+    let mut mean = Array1::<f64>::zeros(total_features);
+    let mut cov = Array2::<f64>::zeros((total_features, total_features));
+    let mut components: Array2<f64>;
+    let mut explained_variance: Vec<f64>;
+    let mut n_samples_seen: usize = 0;
+
     for batch_start in (0..n_samples).step_by(batch_size) {
         let batch_end = std::cmp::min(batch_start + batch_size, n_samples);
-        let batch_size = batch_end - batch_start;
-        
-        // Extract this batch of data
+        let current_batch_size = batch_end - batch_start;
+
+        // Extract this batch
         let batch_data = data_matrix.slice(ndarray::s![batch_start..batch_end, ..]);
-        
-        // Incremental fit
+
+        // Compute batch mean
+        let batch_mean = batch_data.sum_axis(ndarray::Axis(0)) / current_batch_size as f64;
+
         if n_samples_seen == 0 {
-            // First batch - initialize
-            for i in 0..batch_size {
-                mean += &batch_data.row(i);
-            }
-            mean /= batch_size as f64;
-            
-            // Center data
+            // First batch - initialize mean and covariance
+            mean = batch_mean;
+
+            // Center data and compute covariance
             let mut centered = batch_data.to_owned();
-            for i in 0..batch_size {
+            for i in 0..current_batch_size {
                 for j in 0..total_features {
                     centered[[i, j]] -= mean[j];
                 }
             }
-            
-            // Compute covariance
-            let cov = centered.t().dot(&centered) / (batch_size as f64 - 1.0);
-            
-            // Eigendecomposition
-            let eig = match cov.eig() {
-                Ok(eig) => eig,
-                Err(e) => {
-                    error!("Eigendecomposition failed: {:?}", e);
-                    return (
-                        mean, 
-                        Array2::<f64>::zeros((total_features, n_components)),
-                        vec![0.0; n_components],
-                        Array2::<f64>::zeros((n_samples, n_components))
-                    );
-                }
-            };
-            
-            let (eigenvalues, eigenvectors) = eig;
-            
-            // Convert complex eigenvectors to real values
-            for i in 0..total_features {
-                for j in 0..total_features {
-                    components[[i, j]] = eigenvectors[[i, j]].re;
-                }
+
+            if current_batch_size > 1 {
+                cov = centered.t().dot(&centered) / (current_batch_size as f64 - 1.0);
             }
-            
-            // Extract real part of eigenvalues
-            explained_variance = eigenvalues.iter()
-                .map(|&c| c.re)
-                .collect();
         } else {
-            // Subsequent batches - update mean and components
+            // Subsequent batches - proper incremental covariance update
+            // Based on Welford's online algorithm / Chan et al. parallel algorithm
             let old_mean = mean.clone();
-            let old_sample_count = n_samples_seen as f64;
-            let new_sample_count = batch_size as f64;
-            let total_samples = old_sample_count + new_sample_count;
-            
+            let old_n = n_samples_seen as f64;
+            let new_n = current_batch_size as f64;
+            let total_n = old_n + new_n;
+
             // Update mean
-            let batch_mean = batch_data.sum_axis(ndarray::Axis(0)) / new_sample_count;
-            mean = (old_mean * old_sample_count + batch_mean * new_sample_count) / total_samples;
-            
-            // Center data
+            mean = (&old_mean * old_n + &batch_mean * new_n) / total_n;
+
+            // Center batch data with updated mean
             let mut centered = batch_data.to_owned();
-            for i in 0..batch_size {
+            for i in 0..current_batch_size {
                 for j in 0..total_features {
                     centered[[i, j]] -= mean[j];
                 }
             }
-            
-            // Update covariance
-            let batch_cov = centered.t().dot(&centered) / (new_sample_count - 1.0);
-            let old_cov = components.dot(&components.t());
-            let new_cov = (old_cov * old_sample_count + batch_cov * new_sample_count) / total_samples;
-            
-            // Eigendecomposition on updated covariance
-            let eig = match new_cov.eig() {
-                Ok(eig) => eig,
-                Err(e) => {
-                    error!("Eigendecomposition failed: {:?}", e);
-                    return (
-                        mean, 
-                        Array2::<f64>::zeros((total_features, n_components)),
-                        vec![0.0; n_components],
-                        Array2::<f64>::zeros((n_samples, n_components))
-                    );
-                }
+
+            // Compute batch covariance (centered with new mean)
+            let batch_cov = if current_batch_size > 1 {
+                centered.t().dot(&centered) / (new_n - 1.0)
+            } else {
+                Array2::<f64>::zeros((total_features, total_features))
             };
-            
-            let (eigenvalues, eigenvectors) = eig;
-            
-            // Convert complex eigenvectors to real values
-            for i in 0..total_features {
-                for j in 0..total_features {
-                    components[[i, j]] = eigenvectors[[i, j]].re;
-                }
-            }
-            
-            // Extract real part of eigenvalues
-            explained_variance = eigenvalues.iter()
-                .map(|&c| c.re)
-                .collect();
+
+            // Mean shift correction term (accounts for difference between old and new means)
+            let mean_diff = &batch_mean - &old_mean;
+            let mean_diff_col = mean_diff.clone().insert_axis(ndarray::Axis(1));
+            let mean_diff_row = mean_diff.insert_axis(ndarray::Axis(0));
+            let mean_correction = mean_diff_col.dot(&mean_diff_row) * (old_n * new_n / total_n);
+
+            // Weighted combination of old and new covariance + mean shift correction
+            cov = (&cov * (old_n - 1.0) + &batch_cov * (new_n - 1.0) + &mean_correction) / (total_n - 1.0);
         }
-        
-        n_samples_seen += batch_size;
+
+        n_samples_seen += current_batch_size;
         pb.set_position(n_samples_seen as u64);
     }
-    
+
+    // Symmetric eigendecomposition (eigh) for the covariance matrix
+    // eigh is numerically stable for symmetric positive semi-definite matrices
+    // and guaranteed to return real eigenvalues
+    let eig = match cov.eigh(UPLO::Upper) {
+        Ok(eig) => eig,
+        Err(e) => {
+            error!("Eigendecomposition failed: {:?}", e);
+            return (
+                mean,
+                Array2::<f64>::zeros((total_features, n_components)),
+                vec![0.0; n_components],
+                Array2::<f64>::zeros((n_samples, n_components))
+            );
+        }
+    };
+
+    let (eigenvalues, eigenvectors) = eig;
+
+    // eigh returns real eigenvalues directly (no complex conversion needed)
+    components = eigenvectors;
+    explained_variance = eigenvalues.to_vec();
+
     pb.finish_with_message("PCA complete");
     
     // Sort eigenvalues and eigenvectors in descending order
@@ -2691,7 +3059,331 @@ fn incremental_pca(
     (mean, sorted_components, sorted_variance, transformed)
 }
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/// Optimized DBSCAN implementation using approximate nearest neighbors
+fn optimized_dbscan<const D: usize>(
+    data: &ndarray::Array2<f64>,
+    eps: f64,
+    min_samples: usize
+) -> Vec<isize> {
+    use indicatif::{ProgressBar, ProgressStyle};
+    use std::collections::VecDeque;
+    use rayon::prelude::*;
+    
+    let n_points = data.nrows();
+    let eps_sq = eps * eps;
+    
+    // Progress bar
+    let pb = ProgressBar::new(n_points as u64);
+    pb.set_style(
+        ProgressStyle::with_template(
+            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}"
+        ).unwrap()
+        .progress_chars("##-")
+    );
+    pb.set_message("Building spatial index");
+    
+    // Convert data to appropriate format for spatial index
+    let mut points = Vec::with_capacity(n_points);
+    for i in 0..n_points {
+        let mut point = [0.0; D];
+        for j in 0..D {
+            point[j] = data[[i, j]];
+        }
+        points.push((i, point));
+    }
+    
+    // Build optimized spatial index
+    let spatial_index = build_optimized_spatial_index(&points, eps_sq);
+    pb.set_message("Finding neighbors");
+    
+    // Pre-compute neighbors for all points in parallel
+    let neighbors_list: Vec<Vec<usize>> = (0..n_points)
+        .into_par_iter()
+        .map(|i| {
+            if i % 1000 == 0 {
+                pb.set_position((i / 1000) as u64);
+            }
+            query_neighbors(&spatial_index, &points, i, eps_sq)
+        })
+        .collect();
+    
+    pb.set_message("Clustering points");
+    
+    // Run DBSCAN with pre-computed neighbors
+    let mut labels = vec![-1isize; n_points];
+    let mut cluster_id: isize = 0;
+    
+    for i in 0..n_points {
+        pb.set_position(i as u64);
+        
+        // Skip already classified points
+        if labels[i] != -1 {
+            continue;
+        }
+        
+        let neighbors = &neighbors_list[i];
+        
+        // Check if it's a core point
+        if neighbors.len() < min_samples {
+            continue; // Not a core point
+        }
+        
+        // Start a new cluster
+        cluster_id += 1;
+        labels[i] = cluster_id;
+        
+        // Process neighbors with breadth-first search
+        let mut queue = VecDeque::new();
+        for &n in neighbors {
+            if labels[n] == -1 { // Unclassified
+                queue.push_back(n);
+            }
+        }
+        
+        while let Some(current) = queue.pop_front() {
+            // Skip points already in a cluster
+            if labels[current] != -1 {
+                continue;
+            }
+            
+            // Add current point to cluster
+            labels[current] = cluster_id;
+            
+            // If current point is a core point, expand cluster
+            let current_neighbors = &neighbors_list[current];
+            if current_neighbors.len() >= min_samples {
+                for &neighbor in current_neighbors {
+                    if labels[neighbor] == -1 { // Unclassified
+                        queue.push_back(neighbor);
+                    }
+                }
+            }
+        }
+    }
+    
+    pb.finish_with_message("DBSCAN completed");
+    labels
+}
+
+/// Build optimized spatial index based on data dimensionality and size
+fn build_optimized_spatial_index<const D: usize>(
+    points: &[(usize, [f64; D])], 
+    eps_sq: f64
+) -> SpatialIndex<D> {
+    // For small datasets or high dimensions, use a simple index
+    if points.len() < 10000 || D > 5 {
+        return build_grid_index(points, eps_sq.sqrt());
+    } else {
+        // For larger datasets in lower dimensions, use a tree-based index
+        return build_tree_index(points);
+    }
+}
+
+/// Build a grid-based spatial index for high-dimensional data
+fn build_grid_index<const D: usize>(
+    points: &[(usize, [f64; D])], 
+    cell_size: f64
+) -> SpatialIndex<D> {
+    use std::collections::HashMap;
+    
+    // Find data bounds
+    let mut min_vals = [f64::MAX; D];
+    let mut max_vals = [f64::MIN; D];
+    
+    for &(_, point) in points {
+        for d in 0..D {
+            min_vals[d] = min_vals[d].min(point[d]);
+            max_vals[d] = max_vals[d].max(point[d]);
+        }
+    }
+    
+    // Build grid cells
+    let mut grid: HashMap<Vec<isize>, Vec<usize>> = HashMap::new();
+    
+    for &(idx, point) in points {
+        let mut cell_coords = Vec::with_capacity(D);
+        for d in 0..D {
+            let coord = ((point[d] - min_vals[d]) / cell_size) as isize;
+            cell_coords.push(coord);
+        }
+        
+        grid.entry(cell_coords).or_default().push(idx);
+    }
+    
+    SpatialIndex::Grid { 
+        grid, 
+        min_vals, 
+        cell_size,
+    }
+}
+
+/// Build a tree-based spatial index for lower-dimensional data
+fn build_tree_index<const D: usize>(
+    points: &[(usize, [f64; D])]
+) -> SpatialIndex<D> {
+    use kiddo::float::kdtree::KdTree;
+    use std::sync::Arc;
+    
+    const BUCKET_SIZE: usize = 32;
+    
+    let mut tree = KdTree::<f64, usize, D, BUCKET_SIZE, u32>::new();
+    
+    for &(idx, point) in points {
+        tree.add(&point, idx);
+    }
+    
+    SpatialIndex::KdTree { 
+        tree: Arc::new(tree),
+    }
+}
+
+/// Query neighbors using the appropriate spatial index
+fn query_neighbors<const D: usize>(
+    index: &SpatialIndex<D>,
+    points: &[(usize, [f64; D])],
+    point_idx: usize,
+    eps_sq: f64
+) -> Vec<usize> {
+    match index {
+        SpatialIndex::Grid { grid, min_vals, cell_size } => {
+            // Grid-based neighbor query
+            let (_, point) = points[point_idx];
+            
+            // Calculate the grid cell containing the point
+            let mut cell_coords = Vec::with_capacity(D);
+            for d in 0..D {
+                let coord = ((point[d] - min_vals[d]) / cell_size) as isize;
+                cell_coords.push(coord);
+            }
+            
+            // Search neighboring cells
+            let mut candidates = Vec::new();
+            let mut neighbor_cells = Vec::new();
+            
+            // Generate neighboring cell coordinates
+            let mut coords = Vec::with_capacity(D);
+            generate_neighbor_cells::<D>(D, &cell_coords, &mut coords, &mut neighbor_cells);
+            
+            // Collect points from all neighboring cells
+            for cell in neighbor_cells {
+                if let Some(points_in_cell) = grid.get(&cell) {
+                    candidates.extend(points_in_cell);
+                }
+            }
+            
+            // Filter candidates by actual distance
+            candidates
+                .into_iter()
+                .filter(|&idx| {
+                    if idx == point_idx { return true; }
+                    
+                    let (_, other_point) = points[idx];
+                    squared_euclidean(&point, &other_point) <= eps_sq
+                })
+                .collect()
+        },
+        SpatialIndex::KdTree { tree } => {
+            // KD-tree-based neighbor query
+            use kiddo::float::distance::SquaredEuclidean;
+            
+            let (_, point) = points[point_idx];
+            
+            tree.within::<SquaredEuclidean>(&point, eps_sq)
+                .into_iter()
+                .map(|nn| nn.item)
+                .collect()
+        }
+    }
+}
+
+/// Calculate squared Euclidean distance between two points
+fn squared_euclidean<const D: usize>(p1: &[f64; D], p2: &[f64; D]) -> f64 {
+    let mut sum = 0.0;
+    for d in 0..D {
+        let diff = p1[d] - p2[d];
+        sum += diff * diff;
+    }
+    sum
+}
+
+/// Generate all neighboring cell coordinates recursively
+fn generate_neighbor_cells<const D: usize>(
+    dim: usize,
+    center: &[isize],
+    current: &mut Vec<isize>,
+    result: &mut Vec<Vec<isize>>
+) {
+    if current.len() == dim {
+        result.push(current.clone());
+        return;
+    }
+    
+    let d = current.len();
+    let center_coord = center[d];
+    
+    // Only check adjacent cells (current, previous, next)
+    for offset in -1..=1 {
+        current.push(center_coord + offset);
+        generate_neighbor_cells::<D>(dim, center, current, result);
+        current.pop();
+    }
+}
+
+/// Unified spatial index enum to support different index types
+enum SpatialIndex<const D: usize> {
+    Grid {
+        grid: std::collections::HashMap<Vec<isize>, Vec<usize>>,
+        min_vals: [f64; D],
+        cell_size: f64,
+    },
+    KdTree {
+        tree: std::sync::Arc<kiddo::float::kdtree::KdTree<f64, usize, D, 32, u32>>,
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 /// Function to execute DBSCAN clustering for different dimensions
+#[allow(dead_code)]
 fn dbscan_clustering<const D: usize>(
     data: &ndarray::Array2<f64>,
     eps: f64,
@@ -2887,52 +3579,55 @@ fn compute_cluster_stats(
     stats
 }
 
-/// Taxonomic assignment (simplified implementation)
+/// Assign compositional bin labels to clusters
+///
+/// Note: True taxonomic assignment requires comparison to a reference database
+/// (e.g., BLAST against NCBI nt/nr, or marker gene search with GTDB-Tk).
+/// This function provides compositional bin labels based on GC content ranges
+/// and damage authenticity scores. To get real taxonomy, map representative
+/// sequences from each cluster against a reference database.
 fn assign_taxonomy(
     cluster_stats: &HashMap<isize, ClusterStat>,
-    pca_results: &Array2<f64>, // to implement
-    clusters: &[isize], // to implement
-    k: usize, // to implement
-    sim_threshold: f64, // to implement
-    conf_threshold: f64, // to implement
+    _pca_results: &Array2<f64>,
+    _clusters: &[isize],
+    _k: usize,
+    _sim_threshold: f64,
+    _conf_threshold: f64,
     damage_threshold: f64,
-    mean: &Array1<f64>,
-    eigenvectors: &Array2<f64>, // to implement
+    _mean: &Array1<f64>,
+    _eigenvectors: &Array2<f64>,
 ) -> HashMap<isize, String> {
-    // This is a placeholder implementation
-    
-    let mut taxonomy = HashMap::new();
-    
+    let mut labels = HashMap::new();
+
     for (&cluster_id, stat) in cluster_stats {
-        // Skip noise cluster
         if cluster_id == -1 {
-            taxonomy.insert(cluster_id, "Noise".to_string());
+            labels.insert(cluster_id, "Noise".to_string());
             continue;
         }
-        
-        // Use damage scores to determine authenticity
-        let authentic = stat.avg_damage >= damage_threshold;
-        
-        // For demonstration, assign simple taxonomy based on GC content ranges
-        // later implementation will use reference matching, ML models, etc.
-        let tax_name = if authentic {
-            match stat.avg_gc {
-                gc if gc < 0.35 => "Low GC (authentic)",
-                gc if gc < 0.50 => "Medium GC (authentic)",
-                _ => "High GC (authentic)",
-            }
+
+        // Classify by damage authenticity
+        let authenticity = if stat.avg_damage >= damage_threshold {
+            "ancient"
         } else {
-            match stat.avg_gc {
-                gc if gc < 0.35 => "Low GC (modern)",
-                gc if gc < 0.50 => "Medium GC (modern)",
-                _ => "High GC (modern)",
-            }
+            "modern/ambiguous"
         };
-        
-        taxonomy.insert(cluster_id, tax_name.to_string());
+
+        // Classify by GC content bin
+        let gc_bin = match stat.avg_gc {
+            gc if gc < 0.30 => "very-low-GC",
+            gc if gc < 0.40 => "low-GC",
+            gc if gc < 0.50 => "mid-GC",
+            gc if gc < 0.60 => "high-GC",
+            _ => "very-high-GC",
+        };
+
+        labels.insert(
+            cluster_id,
+            format!("Bin {} [{}, {}]", cluster_id, gc_bin, authenticity),
+        );
     }
-    
-    taxonomy
+
+    labels
 }
 
 /// Generate report and cluster statistics
@@ -4048,6 +4743,7 @@ impl_dbscan_for_dim!(20);
 
 
 /// Wrapper function to call the correct implementation based on dimensions
+#[allow(dead_code)]
 pub fn dynamic_dbscan_clustering(data: &ndarray::Array2<f64>, eps: f64, min_samples: usize) -> Vec<isize> {
     match data.ncols() {
         2 => <[(); 2]>::dbscan_clustering(data, eps, min_samples),
@@ -4275,7 +4971,7 @@ fn main() {
         export_with_metadata: matches.get_flag("export_with_metadata"),
     };
 
-    info!("Starting MADERA Pipeline v0.3.0");
+    info!("Starting MADERA Pipeline v0.3.1");
     
     // Validate parameters
     if args.pca_components > 20 {
@@ -4321,7 +5017,7 @@ fn display_banner() {
              
                                         
 Metagenomic Ancient DNA Evaluation and Reference-free Analysis
-version 0.3.0
+version 0.3.1
 "#);
     println!("An advanced pipeline for ancient DNA quality control, damage pattern analysis,");
     println!("clustering, and taxonomic assignment without requiring reference genomes.");
@@ -4340,7 +5036,7 @@ version 0.3.0
 /// Setup the help menu and command line arguments
 fn setup_cli() -> Command {
     Command::new("MADERA")
-        .version("0.3.0")
+        .version("0.3.1")
         .about(format!("{}\n{}",
             "MADERA Pipeline: Metagenomic Ancient DNA Evaluation and Reference-free Analysis".bright_green().bold(),
             "An advanced tool for ancient DNA quality control and clustering analysis".cyan()
@@ -4609,7 +5305,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                           detected_type, expected_type).into());
     }
     
-    info!("Starting MADERA Pipeline v0.3.0");
+    info!("Starting MADERA Pipeline v0.3.1");
     info!("Input file: {} ({})", file_path, detected_type);
     
     // Quality control
@@ -4656,7 +5352,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let gc_scores = compute_gc_for_reads(&reads);
     info!("GC content calculation finished for {} reads", gc_scores.len());
     
-    let damage_scores = damage_assessment(&reads, args.damage_window);
+    let damage_scores = optimized_damage_assessment(&reads, args.damage_window);
     info!("Damage assessment finished for {} reads", damage_scores.len());
 
     info!("Processed GC content for {} reads", gc_scores.len());
@@ -4735,84 +5431,133 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // 10. Log-likelihood ratio: 1 feature
     // Total: kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12
     
+    // Note: codon usage on random reading frames is unreliable for aDNA reads
+    // (reads start at arbitrary genome positions, so reading frame is unknown).
+    // The feature is kept for compatibility but disabled by default (--use_codon flag).
     let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12;
     info!("Total feature space dimension: {}", total_features);
-    
-    // Define feature extractor closure - ensure it adds exactly total_features features
+
+    // Precompute change point and decay model results ONCE per read
+    // This avoids redundant recomputation during feature extraction
+    info!("Precomputing damage model features...");
+    let precomputed_cp: HashMap<String, ChangePointResults> = reads.iter()
+        .map(|read| {
+            let cp = detect_damage_change_points(read, args.damage_window);
+            (read.id.clone(), cp)
+        })
+        .collect();
+
+    let precomputed_decay: HashMap<String, DecayModelResults> = reads.iter()
+        .map(|read| {
+            let decay = fit_decay_damage_model(read, args.damage_window);
+            (read.id.clone(), decay)
+        })
+        .collect();
+
+    let precomputed_pairs: HashMap<String, ReadPairResults> = reads.iter()
+        .map(|read| {
+            let pair = analyze_read_pair_overlaps(read);
+            (read.id.clone(), pair)
+        })
+        .collect();
+    info!("Precomputed damage model features for {} reads", precomputed_cp.len());
+
+    // Define feature extractor closure using precomputed results (no recomputation)
     let feature_extractor = |read: &Read| -> Vec<f64> {
         let mut features = Vec::with_capacity(total_features);
-        
+
         // 1. k-mer frequencies
         let freq = compute_kmer_freq(&read.seq, args.k, &kmers_list);
         for kmer in &kmers_list {
             features.push(*freq.get(kmer).unwrap_or(&0.0));
         }
-        
-        // 2. Optional codon usage
+
+        // 2. Optional codon usage (disabled by default - unreliable on random reading frames)
         if let Some(ref codon_list) = codon_list {
             let usage = compute_codon_usage(&read.seq);
             for codon in codon_list {
                 features.push(*usage.get(codon).unwrap_or(&0.0));
             }
         }
-        
+
         // 3. GC content (1 feature)
         if let Some(&gc) = gc_scores.get(&read.id) {
             features.push(gc);
         } else {
             features.push(compute_gc_content(&read.seq));
         }
-        
+
         // 4. Damage scores (3 features)
         if let Some(damage) = damage_scores.get(&read.id) {
             features.push(damage.damage5);
             features.push(damage.damage3);
             features.push(damage.combined);
         } else {
-            features.push(0.2); // Default damage5
-            features.push(0.2); // Default damage3
-            features.push(0.2); // Default combined
+            features.push(0.2);
+            features.push(0.2);
+            features.push(0.2);
         }
-        
-        // 5. Change point confidence (1 feature)
-        let cp_results = detect_damage_change_points(read, args.damage_window);
+
+        // 5. Change point confidence (1 feature) - from precomputed results
+        let default_cp = ChangePointResults {
+            prime5_pvalue: 1.0,
+            prime3_pvalue: 1.0,
+            prime5_score: 0.0,
+            prime3_score: 0.0,
+        };
+        let cp_results = precomputed_cp.get(&read.id).unwrap_or(&default_cp);
         features.push(1.0 - cp_results.prime5_pvalue.min(cp_results.prime3_pvalue));
-        
-        // 6. Model fit quality (2 features)
-        let decay_results = fit_decay_damage_model(read, args.damage_window);
+
+        // 6. Model fit quality (2 features) - from precomputed results
+        let default_decay = DecayModelResults {
+            prime5_lambda: 0.0,
+            prime3_lambda: 0.0,
+            prime5_model_fit: 0.0,
+            prime3_model_fit: 0.0,
+            log_likelihood_ratio: 0.0,
+        };
+        let decay_results = precomputed_decay.get(&read.id).unwrap_or(&default_decay);
         features.push(decay_results.prime5_model_fit);
         features.push(decay_results.prime3_model_fit);
-        
+
         // 7. Damage ratio (1 feature)
         let damage = damage_scores.get(&read.id).unwrap_or(&DamageScore {
             damage5: 0.2,
             damage3: 0.2,
             combined: 0.2,
         });
-        
+
         let damage_ratio = if damage.damage3 > 0.0 {
             damage.damage5 / damage.damage3
         } else {
-            2.0 // Default when no 3' damage
+            2.0
         };
-        features.push(damage_ratio.min(3.0).max(0.33)); // Clip to reasonable range
-        
-        // 8. Position-specific decay rate features (2 features)
+        features.push(damage_ratio.min(3.0).max(0.33));
+
+        // 8. Position-specific decay rate features (2 features) - from precomputed results
         features.push(decay_results.prime5_lambda);
         features.push(decay_results.prime3_lambda);
-        
-        // 9. Read pair support (1 feature)
-        let read_pair_results = analyze_read_pair_overlaps(read);
+
+        // 9. Read pair support (1 feature) - from precomputed results
+        let default_pair = ReadPairResults {
+            has_overlap: false,
+            overlap_size: 0,
+            c_to_t_mismatches: 0,
+            g_to_a_mismatches: 0,
+            other_mismatches: 0,
+            pair_support_score: 0.5,
+        };
+        let read_pair_results = precomputed_pairs.get(&read.id).unwrap_or(&default_pair);
         features.push(read_pair_results.pair_support_score);
-        
-        // 10. Log-likelihood ratio (1 feature)
+
+        // 10. Log-likelihood ratio (1 feature) - from precomputed results
         features.push((decay_results.log_likelihood_ratio.max(-5.0).min(5.0) + 5.0) / 10.0);
-        
-        // Safety check - ensure we have exactly the expected number of features
-        assert_eq!(features.len(), total_features, 
-            "Feature count mismatch for read {}: got {}, expected {}", 
+
+        // Safety check
+        assert_eq!(features.len(), total_features,
+            "Feature count mismatch for read {}: got {}, expected {}",
             read.id, features.len(), total_features);
-        
+
         features
     };
     
@@ -4828,9 +5573,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         return Err("PCA failed: no valid feature vectors could be extracted".into());
     }
     
-    // If we have fewer dimensions than requested, adjust
     let actual_dimensions = pca_results.ncols();
-    
     info!("PCA yielded {} dimensions (requested: {})", actual_dimensions, args.pca_components);
 
     info!("PCA complete. Explained variance:");
@@ -4839,8 +5582,6 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         let explained = (val / total_variance) * 100.0;
         info!("  PC{}: {:.2}% (eigenvalue: {:.4})", i+1, explained, val);
     }
-    // Ensure we have enough dimensions for clustering
-    let actual_dimensions = pca_results.ncols();
     if actual_dimensions == 0 {
         return Err("PCA resulted in zero dimensions. Cannot perform clustering.".into());
     }
@@ -4887,14 +5628,14 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Dynamic dispatch for DBSCAN based on dimensions
         match cluster_dimensions {
-            2 => dbscan_clustering::<2>(&pca_results, eps, args.min_samples),
-            3 => dbscan_clustering::<3>(&pca_results, eps, args.min_samples),
-            4 => dbscan_clustering::<4>(&pca_results, eps, args.min_samples),
-            5 => dbscan_clustering::<5>(&pca_results, eps, args.min_samples),
+            2 => optimized_dbscan::<2>(&pca_results, eps, args.min_samples),
+            3 => optimized_dbscan::<3>(&pca_results, eps, args.min_samples),
+            4 => optimized_dbscan::<4>(&pca_results, eps, args.min_samples),
+            5 => optimized_dbscan::<5>(&pca_results, eps, args.min_samples),
             _ => {
                 warn!("DBSCAN not directly supported for {} dimensions. Using first 5 components.", cluster_dimensions);
                 let truncated = truncate_pca_dimensions(&pca_results, 5);
-                dbscan_clustering::<5>(&truncated, eps, args.min_samples)
+                optimized_dbscan::<5>(&truncated, eps, args.min_samples)
             }
         }
     };
