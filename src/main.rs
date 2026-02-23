@@ -184,8 +184,19 @@ pub struct Read {
 #[derive(Debug, Clone)]
 struct DamageScore {
     damage5: f64,
-    damage3: f64, 
+    damage3: f64,
     combined: f64,
+}
+
+/// Combined damage assessment results including intermediate computations.
+/// This avoids duplicate work: optimized_damage_assessment computes change point
+/// and decay model internally for the accurate path, so we return those results
+/// alongside the final score to reuse in feature extraction.
+#[derive(Debug, Clone)]
+struct DamageAssessmentResult {
+    score: DamageScore,
+    change_point: Option<ChangePointResults>,
+    decay_model: Option<DecayModelResults>,
 }
 
 #[derive(Debug)]
@@ -762,12 +773,16 @@ fn compute_gc_content(seq: &str) -> f64 {
 
 
 
-/// Optimized damage assessment with adaptive algorithm selection
-pub fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageScore> {
+/// Optimized damage assessment with adaptive algorithm selection.
+/// Returns DamageAssessmentResult per read, which includes the DamageScore plus
+/// intermediate ChangePointResults and DecayModelResults (when available from the
+/// accurate path). This eliminates duplicate computation — the pipeline can extract
+/// intermediate results directly instead of recomputing them.
+pub fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageAssessmentResult> {
     use rayon::prelude::*;
     use std::sync::Mutex;
     use indicatif::{ProgressBar, ProgressStyle};
-    
+
     let total_reads = reads.len();
     let pb = ProgressBar::new(total_reads as u64);
     pb.set_style(
@@ -777,53 +792,54 @@ pub fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMa
         .unwrap()
         .progress_chars("##-")
     );
-    
-    // Thread-local storage for temp data to reduce allocation
-    thread_local! {
-        static LOCAL_BUFFER: std::cell::RefCell<Vec<(usize, f64)>> = std::cell::RefCell::new(Vec::with_capacity(64));
-    }
-    
+
     // Pre-allocate result map
-    let damage_scores = Mutex::new(HashMap::with_capacity(total_reads));
-    
+    let results = Mutex::new(HashMap::with_capacity(total_reads));
+
     // Process in parallel chunks with adaptive algorithm selection
     let chunk_size = std::cmp::max(1, total_reads / rayon::current_num_threads());
-    
+
     reads.par_chunks(chunk_size).for_each(|chunk| {
-        let mut local_scores = HashMap::with_capacity(chunk.len());
-        
+        let mut local_results = HashMap::with_capacity(chunk.len());
+
         for read in chunk {
             // Fast path for very short reads
             if read.seq.len() < 15 {
-                local_scores.insert(read.id.clone(), DamageScore {
-                    damage5: 0.1,
-                    damage3: 0.1,
-                    combined: 0.1,
+                local_results.insert(read.id.clone(), DamageAssessmentResult {
+                    score: DamageScore { damage5: 0.1, damage3: 0.1, combined: 0.1 },
+                    change_point: None,
+                    decay_model: None,
                 });
                 continue;
             }
-            
-            // Heuristic: If read length >= 100, use estimation-based approach
-            let damage = if read.seq.len() >= 100 {
-                compute_damage_score_fast(read, window_size)
+
+            // Heuristic: If read length >= 100, use estimation-based approach (fast path)
+            // For shorter reads, use full algorithm which also returns intermediate results
+            let result = if read.seq.len() >= 100 {
+                let fast_score = compute_damage_score_fast(read, window_size);
+                DamageAssessmentResult {
+                    score: fast_score,
+                    change_point: None,
+                    decay_model: None,
+                }
             } else {
-                // For shorter reads, use full algorithm
+                // Accurate path returns intermediate results alongside the score
                 compute_damage_score_accurate(read, window_size)
             };
-            
-            local_scores.insert(read.id.clone(), damage);
+
+            local_results.insert(read.id.clone(), result);
         }
-        
-        // Update the global scores
-        let mut scores = damage_scores.lock().unwrap();
-        scores.extend(local_scores);
-        
+
+        // Update the global results
+        let mut all_results = results.lock().unwrap();
+        all_results.extend(local_results);
+
         pb.inc(chunk.len() as u64);
     });
-    
+
     pb.finish_with_message("Damage assessment complete");
-    
-    damage_scores.into_inner().unwrap()
+
+    results.into_inner().unwrap()
 }
 
 /// Fast damage assessment for longer reads using approximation methods
@@ -971,112 +987,113 @@ fn count_ag_bases(segment: &str) -> (usize, usize) {
     (a_count, g_count)
 }
 
-/// Accurate method for smaller reads (similar to original but optimized)
-fn compute_damage_score_accurate(read: &Read, window_size: usize) -> DamageScore {
-    // Use thread-local storage for temporary data
-    thread_local! {
-        static FIVE_FREQS: std::cell::RefCell<Vec<[f64; 4]>> = std::cell::RefCell::new(Vec::with_capacity(64));
-        static THREE_FREQS: std::cell::RefCell<Vec<[f64; 4]>> = std::cell::RefCell::new(Vec::with_capacity(64));
-        static DEAM_SITES: std::cell::RefCell<Vec<(usize, f64)>> = std::cell::RefCell::new(Vec::with_capacity(64));
-    }
-    
+/// Accurate damage scoring for shorter reads, returning intermediate results.
+/// Uses stack-local buffers instead of thread_local! (which is unsafe with Rayon's
+/// work-stealing thread pool where tasks can migrate between threads).
+/// Returns DamageAssessmentResult containing the score plus intermediate change point
+/// and decay model results, eliminating the need to recompute them later.
+fn compute_damage_score_accurate(read: &Read, window_size: usize) -> DamageAssessmentResult {
     let seq = &read.seq;
     let seq_len = seq.len();
-    
+
     // Early exit for very short reads
     if seq_len < 15 {
-        return DamageScore {
-            damage5: 0.1,
-            damage3: 0.1,
-            combined: 0.1,
+        return DamageAssessmentResult {
+            score: DamageScore { damage5: 0.1, damage3: 0.1, combined: 0.1 },
+            change_point: None,
+            decay_model: None,
         };
     }
-    
+
     // Define window sizes adaptively based on read length
     let max_window = std::cmp::min(window_size * 3, seq_len / 4);
-    
+
     // Extract sequence segments for analysis
     let five_prime = &seq[0..std::cmp::min(max_window, seq_len / 2)];
     let three_prime = &seq[seq_len.saturating_sub(std::cmp::min(max_window, seq_len / 2))..];
-    
+
     // Quick check for damage signatures
     let (t_count_5p, c_count_5p) = count_tc_bases(five_prime);
     let (a_count_3p, g_count_3p) = count_ag_bases(three_prime);
-    
+
     // If there's very little potential for damage, use fast path
     if (t_count_5p + c_count_5p < 5) || (a_count_3p + g_count_3p < 5) {
-        return compute_damage_score_fast(read, window_size);
+        let fast_score = compute_damage_score_fast(read, window_size);
+        return DamageAssessmentResult {
+            score: fast_score,
+            change_point: None,
+            decay_model: None,
+        };
     }
-    
+
+    // Stack-local buffers (safe with Rayon, unlike thread_local!)
+    let mut five_freqs = Vec::with_capacity(64);
+    let mut three_freqs = Vec::with_capacity(64);
+    let mut deam_sites_5 = Vec::with_capacity(64);
+    let mut deam_sites_3 = Vec::with_capacity(64);
+
     // Calculate optimized change point detection
-    let cp5 = FIVE_FREQS.with(|freqs| {
-        let mut freqs_vec = freqs.borrow_mut();
-        freqs_vec.clear();
-        
-        // Collect frequencies more efficiently
-        collect_position_frequencies(five_prime, true, &mut freqs_vec);
-        
-        // Find change point with optimized algorithm 
-        find_optimized_change_point(&freqs_vec, 'T', 'C')
-    });
-    
-    let cp3 = THREE_FREQS.with(|freqs| {
-        let mut freqs_vec = freqs.borrow_mut();
-        freqs_vec.clear();
-        
-        // Collect frequencies more efficiently
-        collect_position_frequencies(three_prime, false, &mut freqs_vec);
-        
-        // Find change point with optimized algorithm
-        find_optimized_change_point(&freqs_vec, 'A', 'G')
-    });
-    
+    collect_position_frequencies(five_prime, true, &mut five_freqs);
+    let cp5 = find_optimized_change_point(&five_freqs, 'T', 'C');
+
+    collect_position_frequencies(three_prime, false, &mut three_freqs);
+    let cp3 = find_optimized_change_point(&three_freqs, 'A', 'G');
+
     // Calculate change point scores
-    let cp5_score = calculate_change_point_score(&FIVE_FREQS.with(|f| f.borrow().clone()), cp5.position);
-    let cp3_score = calculate_change_point_score(&THREE_FREQS.with(|f| f.borrow().clone()), cp3.position);
-    
+    let cp5_score = calculate_change_point_score(&five_freqs, cp5.position);
+    let cp3_score = calculate_change_point_score(&three_freqs, cp3.position);
+
     // Apply optimized decay model with binary search
-    let decay5 = DEAM_SITES.with(|sites| {
-        let mut sites_vec = sites.borrow_mut();
-        sites_vec.clear();
-        
-        identify_potential_deamination(five_prime, true, &mut sites_vec);
-        fit_optimized_decay_model(&sites_vec)
-    });
-    
-    let decay3 = DEAM_SITES.with(|sites| {
-        let mut sites_vec = sites.borrow_mut();
-        sites_vec.clear();
-        
-        identify_potential_deamination(three_prime, false, &mut sites_vec);
-        fit_optimized_decay_model(&sites_vec)
-    });
-    
+    identify_potential_deamination(five_prime, true, &mut deam_sites_5);
+    let decay5 = fit_optimized_decay_model(&deam_sites_5);
+
+    identify_potential_deamination(three_prime, false, &mut deam_sites_3);
+    let decay3 = fit_optimized_decay_model(&deam_sites_3);
+
     // Calculate final scores
     let damage5 = 0.6 * cp5_score + 0.4 * decay5.fit_quality;
     let damage3 = 0.6 * cp3_score + 0.4 * decay3.fit_quality;
-    
+
     // Calculate authenticity score based on multiple factors
     let length_factor = if seq_len < 50 { 0.9 }
                     else if seq_len < 100 { 0.7 }
                     else if seq_len < 150 { 0.5 }
                     else if seq_len < 200 { 0.3 }
                     else { 0.1 };
-    
+
     let balance_factor = if damage5 > 0.2 && damage3 > 0.2 {
         1.0 - (damage5 - damage3).abs() / (damage5 + damage3).max(0.1)
     } else {
         0.5
     };
-    
-    let combined = 0.4 * ((damage5 + damage3) / 2.0) + 
+
+    let combined = 0.4 * ((damage5 + damage3) / 2.0) +
                    0.35 * length_factor +
                    0.25 * balance_factor;
-    
-    DamageScore {
-        damage5,
-        damage3,
-        combined,
+
+    // Build intermediate results to avoid recomputation downstream
+    let cp_results = ChangePointResults {
+        prime5_pvalue: cp5.pvalue,
+        prime3_pvalue: cp3.pvalue,
+        prime5_score: cp5_score,
+        prime3_score: cp3_score,
+    };
+
+    // Compute log-likelihood ratio for decay model
+    let ll_ratio = (decay5.fit_quality - 0.5).max(0.0) + (decay3.fit_quality - 0.5).max(0.0);
+
+    let decay_results = DecayModelResults {
+        prime5_lambda: decay5.lambda,
+        prime3_lambda: decay3.lambda,
+        prime5_model_fit: decay5.fit_quality,
+        prime3_model_fit: decay3.fit_quality,
+        log_likelihood_ratio: ll_ratio,
+    };
+
+    DamageAssessmentResult {
+        score: DamageScore { damage5, damage3, combined },
+        change_point: Some(cp_results),
+        decay_model: Some(decay_results),
     }
 }
 
@@ -1378,6 +1395,7 @@ fn fit_optimized_decay_model(deam_sites: &[(usize, f64)]) -> ExponentialModel {
 
 
 /// Calculate damage scores for ancient DNA reads
+#[allow(dead_code)]
 fn damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageScore> {
     use rayon::prelude::*;
     use std::sync::{Arc, Mutex};
@@ -1518,6 +1536,7 @@ struct DamagePattern {
 
 
 /// Main damage assessment function - integrates multiple methods
+#[allow(dead_code)]
 fn compute_damage_scores(read: &Read, window_size: usize) -> DamageScore {
     // Get the max window size to analyze (we'll use a dynamic approach)
     let max_window = std::cmp::min(window_size * 3, read.seq.len() / 4);
@@ -2694,7 +2713,7 @@ struct ChangePointResult {
     pvalue: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ChangePointResults {
     prime5_pvalue: f64,
     prime3_pvalue: f64,
@@ -2710,7 +2729,7 @@ struct ExponentialModel {
     fit_quality: f64, // How well the model fits (0-1)
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecayModelResults {
     prime5_lambda: f64,
     prime3_lambda: f64,
@@ -5360,24 +5379,26 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     
     // Ensure data consistency before proceeding
     let consistent_reads = ensure_data_consistency(&reads, &gc_scores, &damage_scores);
-    
+
     if consistent_reads.is_empty() {
         return Err("No reads have complete data (GC + damage scores). Cannot proceed.".into());
     }
-    
-    info!("Using {} reads with complete data for further analysis", consistent_reads.len());
 
-    // Find common reads between GC and damage scores
-    let gc_read_ids: HashSet<&String> = gc_scores.keys().collect();
-    let damage_read_ids: HashSet<&String> = damage_scores.keys().collect();
-    let common_reads = gc_read_ids.intersection(&damage_read_ids).count();
-    
-    info!("Reads with both GC content and damage scores: {}", common_reads);
-    
-    if common_reads == 0 {
-        return Err("No reads have both GC content and damage scores. Check data processing.".into());
-    }
-    
+    info!("Using {} reads with complete data for further analysis (filtered from {} total)",
+          consistent_reads.len(), reads.len());
+
+    // IMPORTANT: Replace reads with consistent_reads for ALL downstream processing.
+    // This ensures that only reads with complete data (GC + damage scores) enter
+    // precomputation, PCA, clustering, and export stages.
+    let reads = consistent_reads;
+
+    // Extract score-only map for downstream functions that only need DamageScore.
+    // The full DamageAssessmentResult (with intermediate ChangePoint/Decay results)
+    // is kept in damage_scores for reuse during feature precomputation.
+    let damage_score_map: HashMap<String, DamageScore> = damage_scores.iter()
+        .map(|(id, result)| (id.clone(), result.score.clone()))
+        .collect();
+
     // Precompute feature lists
     let kmers_list = get_all_kmers(args.k);
     info!("Using {}-mer frequency analysis ({} features)", args.k, kmers_list.len());
@@ -5389,35 +5410,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         None 
     };
     
-    // Before starting feature extraction, add this debug information
-    info!("Reads with both GC content and damage scores: {}", common_reads);
-    
-    // If there's a major discrepancy, log a warning
-    if common_reads < reads.len() / 2 {
-        warn!("Less than half of the reads have both GC content and damage scores. Results may be unreliable.");
-        
-        // Display some debugging information
-        let first_few_reads: Vec<&str> = reads.iter()
-            .take(5)
-            .map(|r| r.id.as_str())
-            .collect();
-        
-        let first_few_gc: Vec<&str> = gc_scores.keys()
-            .take(5)
-            .map(|s| s.as_str())
-            .collect();
-        
-        let first_few_damage: Vec<&str> = damage_scores.keys()
-            .take(5)
-            .map(|s| s.as_str())
-            .collect();
-        
-        info!("Sample read IDs: {:?}", first_few_reads);
-        info!("Sample GC score IDs: {:?}", first_few_gc);
-        info!("Sample damage score IDs: {:?}", first_few_damage);
-    }
-    
-    // Calculate total features dimension for PCA - FIX THE COUNT HERE
+    // Calculate total features dimension for PCA
     // Count all the features we're actually adding in the feature_extractor:
     // 1. k-mer frequencies: kmers_list.len()
     // 2. Optional codon usage: codon_list.as_ref().map_or(0, |v| v.len())
@@ -5437,27 +5430,71 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12;
     info!("Total feature space dimension: {}", total_features);
 
-    // Precompute change point and decay model results ONCE per read
-    // This avoids redundant recomputation during feature extraction
-    info!("Precomputing damage model features...");
+    // Extract intermediate results from the damage assessment.
+    // For reads that went through the accurate path (< 100 bp), the ChangePointResults
+    // and DecayModelResults are already computed. For reads that went through the fast
+    // path (>= 100 bp), we compute them now (only for those reads).
+    // This eliminates the duplicate computation that previously existed.
+    info!("Extracting/computing damage model features...");
     let precomputed_cp: HashMap<String, ChangePointResults> = reads.iter()
         .map(|read| {
-            let cp = detect_damage_change_points(read, args.damage_window);
+            // Try to reuse intermediate results from the accurate damage assessment path
+            let cp = if let Some(assessment) = damage_scores.get(&read.id) {
+                if let Some(ref cp_result) = assessment.change_point {
+                    cp_result.clone()
+                } else {
+                    // Fast path reads don't have intermediate results; compute now
+                    detect_damage_change_points(read, args.damage_window)
+                }
+            } else {
+                detect_damage_change_points(read, args.damage_window)
+            };
             (read.id.clone(), cp)
         })
         .collect();
 
     let precomputed_decay: HashMap<String, DecayModelResults> = reads.iter()
         .map(|read| {
-            let decay = fit_decay_damage_model(read, args.damage_window);
+            // Try to reuse intermediate results from the accurate damage assessment path
+            let decay = if let Some(assessment) = damage_scores.get(&read.id) {
+                if let Some(ref decay_result) = assessment.decay_model {
+                    decay_result.clone()
+                } else {
+                    // Fast path reads don't have intermediate results; compute now
+                    fit_decay_damage_model(read, args.damage_window)
+                }
+            } else {
+                fit_decay_damage_model(read, args.damage_window)
+            };
             (read.id.clone(), decay)
         })
         .collect();
 
+    // Two-pass approach for read pair overlap analysis:
+    // Pass 1: Add ALL reads to the pair cache first (so both mates are present)
+    // Pass 2: Process all completed pairs
+    // Pass 3: Collect results for all reads
+    // This fixes the order-dependency bug where read1 would get default results
+    // because read2 hadn't been cached yet when read1 was processed.
+    info!("Populating read pair cache...");
+    for read in &reads {
+        GLOBAL_CACHE.add_read(read);
+    }
+    info!("Processing all read pairs...");
+    GLOBAL_CACHE.process_all_pairs();
+    let default_pair_result = ReadPairResults {
+        has_overlap: false,
+        overlap_size: 0,
+        c_to_t_mismatches: 0,
+        g_to_a_mismatches: 0,
+        other_mismatches: 0,
+        pair_support_score: 0.5,
+    };
     let precomputed_pairs: HashMap<String, ReadPairResults> = reads.iter()
         .map(|read| {
-            let pair = analyze_read_pair_overlaps(read);
-            (read.id.clone(), pair)
+            let result = GLOBAL_CACHE.get_overlap_results(&read.id)
+                .unwrap_or(default_pair_result.clone());
+            (read.id.clone(), result)
         })
         .collect();
     info!("Precomputed damage model features for {} reads", precomputed_cp.len());
@@ -5488,7 +5525,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         // 4. Damage scores (3 features)
-        if let Some(damage) = damage_scores.get(&read.id) {
+        if let Some(damage) = damage_score_map.get(&read.id) {
             features.push(damage.damage5);
             features.push(damage.damage3);
             features.push(damage.combined);
@@ -5521,11 +5558,8 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         features.push(decay_results.prime3_model_fit);
 
         // 7. Damage ratio (1 feature)
-        let damage = damage_scores.get(&read.id).unwrap_or(&DamageScore {
-            damage5: 0.2,
-            damage3: 0.2,
-            combined: 0.2,
-        });
+        let default_damage = DamageScore { damage5: 0.2, damage3: 0.2, combined: 0.2 };
+        let damage = damage_score_map.get(&read.id).unwrap_or(&default_damage);
 
         let damage_ratio = if damage.damage3 > 0.0 {
             damage.damage5 / damage.damage3
@@ -5651,7 +5685,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     // Process cluster results
     info!("Computing cluster statistics...");
     let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
-    let mut cluster_stats = compute_cluster_stats(&read_ids, &clusters, &gc_scores, &damage_scores);
+    let mut cluster_stats = compute_cluster_stats(&read_ids, &clusters, &gc_scores, &damage_score_map);
     
     // Print cluster statistics
     for (&cluster_id, stats) in cluster_stats.iter() {
@@ -5707,11 +5741,11 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         } else {
             // For FASTQ or FASTA exports
             export_clusters(
-                &reads, 
-                &clusters, 
-                &cluster_stats, 
+                &reads,
+                &clusters,
+                &cluster_stats,
                 file_type,
-                &damage_scores,
+                &damage_score_map,
                 &args
             )?;
         }
@@ -5724,11 +5758,11 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         
         let sys = actix_web::rt::System::new();
         sys.block_on(run_dashboard(
-            pca_results, 
-            clusters, 
-            gc_scores, 
-            damage_scores, 
-            read_ids, 
+            pca_results,
+            clusters,
+            gc_scores,
+            damage_score_map,
+            read_ids,
             args.min_samples,
             eigenvalues,
             total_features
@@ -5762,7 +5796,7 @@ fn truncate_pca_dimensions(data: &ndarray::Array2<f64>, dimensions: usize) -> nd
 fn ensure_data_consistency(
     reads: &[Read],
     gc_scores: &HashMap<String, f64>,
-    damage_scores: &HashMap<String, DamageScore>
+    damage_scores: &HashMap<String, DamageAssessmentResult>
 ) -> Vec<Read> {
     use std::collections::HashSet;
     
