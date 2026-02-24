@@ -7,7 +7,7 @@
 //! Michael Schneider 2026
 //! https://github.com/michi-sxc/MADERA
 //! 
-//! v0.4.0
+//! v0.4.1
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use env_logger;
@@ -143,8 +143,8 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     min_cluster_size: usize,
 
-    /// Jensen-Shannon divergence threshold for merging similar clusters (default: 0.01)
-    #[arg(long, default_value_t = 0.01)]
+    /// Jensen-Shannon divergence threshold for merging similar clusters (default: 0.05)
+    #[arg(long, default_value_t = 0.05)]
     merge_threshold: f64,
 
     /// Enable MEGAHIT assembly pre-step for improved clustering
@@ -2933,6 +2933,24 @@ fn build_initial_feature_matrix(
         }
     }
 
+    // Z-score standardize each feature column so all 18 features contribute
+    // equally to Euclidean distance in DBSCAN. Without this, GC (~[0,1]) and
+    // normalized read length (~[0.4,1.0]) dominate over dinucleotide frequencies
+    // (~[0,0.15]), making Phase 1 effectively GC+length-only clustering.
+    for j in 0..n_features {
+        let col = matrix.column(j);
+        let mean = col.mean().unwrap_or(0.0);
+        let variance = col.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n_reads.max(1) as f64;
+        let std_dev = variance.sqrt();
+
+        if std_dev > 1e-10 {
+            for i in 0..n_reads {
+                matrix[[i, j]] = (matrix[[i, j]] - mean) / std_dev;
+            }
+        }
+        // If std_dev ≈ 0, all values are the same — leave as-is (contributes nothing to distance)
+    }
+
     matrix
 }
 
@@ -3449,23 +3467,65 @@ fn build_grid_index<const D: usize>(
     }
 }
 
-/// Build a tree-based spatial index for lower-dimensional data
+/// Build a tree-based spatial index for lower-dimensional data.
+///
+/// Deduplicates points before insertion to prevent kiddo's KdTree from panicking
+/// when too many points share identical coordinates on one axis. Points are grouped
+/// by quantized coordinates (1e-12 resolution); one representative per group is
+/// inserted into the tree, and the dedup_groups map is stored for expanding query
+/// results back to all original point indices.
 fn build_tree_index<const D: usize>(
     points: &[(usize, [f64; D])]
 ) -> SpatialIndex<D> {
     use kiddo::float::kdtree::KdTree;
+    use std::collections::HashMap;
     use std::sync::Arc;
-    
+
     const BUCKET_SIZE: usize = 32;
-    
-    let mut tree = KdTree::<f64, usize, D, BUCKET_SIZE, u32>::new();
-    
+
+    // Deduplicate: group points by quantized coordinates (1e-12 resolution).
+    // Points within 1e-12 on every axis are treated as identical.
+    let mut unique_map: HashMap<[i64; D], (usize, [f64; D], Vec<usize>)> = HashMap::new();
+
     for &(idx, point) in points {
-        tree.add(&point, idx);
+        let mut key = [0i64; D];
+        for d in 0..D {
+            key[d] = (point[d] * 1e12) as i64;
+        }
+        unique_map.entry(key)
+            .and_modify(|entry| entry.2.push(idx))
+            .or_insert_with(|| (idx, point, vec![idx]));
     }
-    
-    SpatialIndex::KdTree { 
+
+    let n_unique = unique_map.len();
+    if n_unique < points.len() {
+        info!("KdTree: deduplicated {} -> {} unique points ({:.1}% reduction)",
+              points.len(), n_unique,
+              100.0 * (1.0 - n_unique as f64 / points.len().max(1) as f64));
+    }
+
+    let mut tree = KdTree::<f64, usize, D, BUCKET_SIZE, u32>::new();
+    let mut dedup_groups: HashMap<usize, Vec<usize>> = HashMap::new();
+
+    // Add unique per-axis perturbation to each representative before insertion.
+    // kiddo panics when >BUCKET_SIZE points share the same value on ANY single axis
+    // (not just fully identical points). After z-score standardization, many reads can
+    // share axis values (e.g., same GC ratio, same read length). Adding idx*1e-10 to
+    // every axis ensures uniqueness. Max perturbation ~130K*1e-10 = 1.3e-5, negligible
+    // vs typical eps (~1.0). Queries use original (non-perturbed) coords, which is fine
+    // since the perturbation is far below eps.
+    for (insert_idx, (_, (repr_idx, repr_point, group))) in unique_map.iter().enumerate() {
+        let mut perturbed = *repr_point;
+        for d in 0..D {
+            perturbed[d] += (insert_idx as f64) * 1e-10;
+        }
+        tree.add(&perturbed, *repr_idx);
+        dedup_groups.insert(*repr_idx, group.clone());
+    }
+
+    SpatialIndex::KdTree {
         tree: Arc::new(tree),
+        dedup_groups,
     }
 }
 
@@ -3514,16 +3574,22 @@ fn query_neighbors<const D: usize>(
                 })
                 .collect()
         },
-        SpatialIndex::KdTree { tree } => {
-            // KD-tree-based neighbor query
+        SpatialIndex::KdTree { tree, dedup_groups } => {
+            // KD-tree-based neighbor query with dedup expansion
             use kiddo::float::distance::SquaredEuclidean;
-            
+
             let (_, point) = points[point_idx];
-            
-            tree.within::<SquaredEuclidean>(&point, eps_sq)
-                .into_iter()
-                .map(|nn| nn.item)
-                .collect()
+
+            let raw_results = tree.within::<SquaredEuclidean>(&point, eps_sq);
+            let mut expanded = Vec::new();
+            for nn in raw_results {
+                if let Some(group) = dedup_groups.get(&nn.item) {
+                    expanded.extend(group.iter().copied());
+                } else {
+                    expanded.push(nn.item);
+                }
+            }
+            expanded
         }
     }
 }
@@ -3570,6 +3636,9 @@ enum SpatialIndex<const D: usize> {
     },
     KdTree {
         tree: std::sync::Arc<kiddo::float::kdtree::KdTree<f64, usize, D, 32, u32>>,
+        /// Maps representative point index -> all point indices sharing that position.
+        /// Used to expand query results after deduplication.
+        dedup_groups: std::collections::HashMap<usize, Vec<usize>>,
     }
 }
 
@@ -4767,8 +4836,13 @@ macro_rules! impl_dbscan_for_dim {
                     for j in 0..$dim {
                         point_arr[j] = point[j];
                     }
+                    // Add unique per-axis perturbation to prevent kiddo panic when
+                    // too many points share the same value on a single axis.
+                    for d in 0..$dim {
+                        point_arr[d] += (i as f64) * 1e-10;
+                    }
                     tree.add(&point_arr, i as u64);
-                    
+
                     if i % 1000 == 0 {
                         pb.set_position(i as u64);
                     }
@@ -5095,46 +5169,64 @@ pub fn compute_k_distance_data(data: &ndarray::Array2<f64>, k: usize) -> Vec<f64
 fn compute_k_distance_for_dim<const D: usize>(data: &ndarray::Array2<f64>, k: usize) -> Vec<f64> {
     use kiddo::float::kdtree::KdTree;
     use kiddo::float::distance::SquaredEuclidean;
-    
+    use std::collections::HashMap;
+
     const B: usize = 256; // Bucket size
     let n_points = data.nrows();
-    let mut tree = KdTree::<f64, u64, D, B, u32>::new();
-    
-    // Build the kd-tree using PCA points
+
+    // Deduplicate points before KdTree insertion to prevent panic on identical coordinates.
+    // Same approach as build_tree_index: quantize to 1e-12 resolution, insert one representative.
+    let mut unique_map: HashMap<[i64; D], (usize, [f64; D], Vec<usize>)> = HashMap::new();
+
     for i in 0..n_points {
-        let point = data.row(i);
         let mut point_arr = [0.0; D];
+        let mut key = [0i64; D];
         for j in 0..D {
-            point_arr[j] = point[j];
+            point_arr[j] = data[[i, j]];
+            key[j] = (data[[i, j]] * 1e12) as i64;
         }
-        tree.add(&point_arr, i as u64);
+        unique_map.entry(key)
+            .and_modify(|entry| entry.2.push(i))
+            .or_insert_with(|| (i, point_arr, vec![i]));
     }
-    
+
+    let mut tree = KdTree::<f64, u64, D, B, u32>::new();
+
+    // Add unique per-axis perturbation to prevent kiddo panic on same-axis collisions.
+    // Same rationale as build_tree_index: after z-score standardization, many points
+    // share values on individual axes (e.g., same GC ratio, same read length).
+    for (insert_idx, (_, (repr_idx, repr_point, _group))) in unique_map.iter().enumerate() {
+        let mut perturbed = *repr_point;
+        for d in 0..D {
+            perturbed[d] += (insert_idx as f64) * 1e-10;
+        }
+        tree.add(&perturbed, *repr_idx as u64);
+    }
+
     let mut kth_distances = Vec::with_capacity(n_points);
-    
-    // For each point, retrieve its k nearest neighbors
+
+    // For each point, retrieve its k nearest neighbors.
+    // The deduplicated tree has exactly one representative per group, so the self-match
+    // is always 1 entry (not group_size). We request k+1 neighbors and take index [k].
     for i in 0..n_points {
-        let point = data.row(i);
         let mut point_arr = [0.0; D];
         for j in 0..D {
-            point_arr[j] = point[j];
+            point_arr[j] = data[[i, j]];
         }
-        
-        // Retrieve k+1 nearest neighbors (including the point itself)
-        let neighbors = tree.nearest_n::<SquaredEuclidean>(&point_arr, k+1);
-        
+
+        // Request k+1 neighbors: +1 for the self-match (only 1 representative in tree)
+        let neighbors = tree.nearest_n::<SquaredEuclidean>(&point_arr, k + 1);
+
         if neighbors.len() > k {
-            // k+1th neighbor (skip self) gives our desired distance
-            // We skip the first one (distance 0 to itself)
+            // k+1th neighbor (skip self at index 0) gives the k-distance
             let kth_sq = neighbors[k].distance;
-            kth_distances.push(kth_sq.sqrt()); // Convert squared distance to Euclidean
+            kth_distances.push(kth_sq.sqrt());
         } else {
-            // If we don't have enough neighbors, use the furthest available
             let furthest = neighbors.last().map(|n| n.distance.sqrt()).unwrap_or(0.0);
             kth_distances.push(furthest);
         }
     }
-    
+
     kth_distances
 }
 
@@ -5182,7 +5274,7 @@ fn main() {
         em_iterations: matches.get_one::<String>("em_iterations").unwrap_or(&String::from("20")).parse().unwrap_or(20),
         em_convergence: matches.get_one::<String>("em_convergence").unwrap_or(&String::from("0.001")).parse().unwrap_or(0.001),
         min_cluster_size: matches.get_one::<String>("min_cluster_size").unwrap_or(&String::from("10")).parse().unwrap_or(10),
-        merge_threshold: matches.get_one::<String>("merge_threshold").unwrap_or(&String::from("0.01")).parse().unwrap_or(0.01),
+        merge_threshold: matches.get_one::<String>("merge_threshold").unwrap_or(&String::from("0.05")).parse().unwrap_or(0.05),
         assemble: matches.get_flag("assemble"),
         megahit_path: matches.get_one::<String>("megahit_path").unwrap_or(&String::from("megahit")).clone(),
         legacy: matches.get_flag("legacy"),
@@ -5978,11 +6070,17 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         // If assembly succeeded, cluster contigs first, then assign reads via EM.
         // If no assembly, cluster reads directly.
         let (cluster_seqs, is_contig_mode) = if let Some(ref contigs) = contigs {
-            if contigs.len() >= 10 {
-                info!("Using {} contigs as primary clustering targets", contigs.len());
+            let assembled_bases: usize = contigs.iter().map(|c| c.seq.len()).sum();
+            let total_input_bases: usize = reads.iter().map(|r| r.seq.len()).sum();
+            let assembly_fraction = assembled_bases as f64 / total_input_bases.max(1) as f64;
+
+            if assembly_fraction > 0.10 {
+                info!("Using {} contigs ({} bp, {:.1}% of input) as primary clustering targets",
+                      contigs.len(), assembled_bases, assembly_fraction * 100.0);
                 (contigs.clone(), true)
             } else {
-                warn!("Too few contigs ({}). Falling back to read-level clustering.", contigs.len());
+                warn!("Assembly captured only {:.1}% of input ({} bp in {} contigs). Falling back to read-level clustering.",
+                      assembly_fraction * 100.0, assembled_bases, contigs.len());
                 (reads.clone(), false)
             }
         } else {

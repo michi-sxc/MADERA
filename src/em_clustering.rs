@@ -215,39 +215,7 @@ impl EMClusterer {
             }
         }
 
-        // Assign unassigned reads (noise + dissolved small clusters) to nearest cluster by GC
-        let cluster_gc_means: Vec<f64> = (0..n_clusters)
-            .map(|c| {
-                let mut sum = 0.0;
-                let mut count = 0;
-                for (i, &a) in assignments.iter().enumerate() {
-                    if a == c {
-                        sum += gc_values[i];
-                        count += 1;
-                    }
-                }
-                if count > 0 { sum / count as f64 } else { 0.5 }
-            })
-            .collect();
-
-        for i in 0..n_reads {
-            if assignments[i] == usize::MAX {
-                // Find nearest cluster by GC distance
-                let gc = gc_values[i];
-                let mut best_cluster = 0;
-                let mut best_dist = f64::MAX;
-                for (c, &mean) in cluster_gc_means.iter().enumerate() {
-                    let dist = (gc - mean).abs();
-                    if dist < best_dist {
-                        best_dist = dist;
-                        best_cluster = c;
-                    }
-                }
-                assignments[i] = best_cluster;
-            }
-        }
-
-        // Build initial profiles from assignments
+        // Build initial profiles from confidently-assigned reads only
         let profiles: Vec<ClusterProfile> = (0..n_clusters)
             .map(|c| {
                 Self::build_profile_from_reads(
@@ -255,6 +223,25 @@ impl EMClusterer {
                 )
             })
             .collect();
+
+        // Assign unassigned reads (noise + dissolved small clusters) using multinomial
+        // log-likelihood against the initial profiles — same logic as the E-step.
+        // This uses the full k-mer profile instead of GC-only distance, correctly
+        // distinguishing organisms with similar GC but different compositional signatures.
+        for i in 0..n_reads {
+            if assignments[i] == usize::MAX {
+                let mut best_cluster = 0;
+                let mut best_ll = f64::NEG_INFINITY;
+                for (c, profile) in profiles.iter().enumerate() {
+                    let ll = multinomial_log_likelihood(&read_kmer_counts[i], &profile.log_probs);
+                    if ll > best_ll {
+                        best_ll = ll;
+                        best_cluster = c;
+                    }
+                }
+                assignments[i] = best_cluster;
+            }
+        }
 
         info!("EM initialized with {} clusters from {} initial assignments",
               n_clusters, n_reads);
@@ -507,6 +494,14 @@ impl EMClusterer {
             .collect();
     }
 
+    // TODO(v0.5.0): Implement cluster splitting for bimodal detection.
+    // After convergence, check each cluster for bimodality by computing the variance
+    // of multinomial log-likelihoods within the cluster. If variance is significantly
+    // higher than expected (estimable from the multinomial model), split the cluster
+    // into two via k-means on the k=4 count vectors, then continue EM.
+    // This is the split-merge EM variant (Ueda et al. 2000) and is the main thing
+    // limiting clustering resolution when DBSCAN merges two organisms into one cluster.
+
     /// Union-find: follow parent chain to root.
     fn find_root(parents: &[usize], mut node: usize) -> usize {
         while parents[node] != node {
@@ -566,8 +561,11 @@ impl EMClusterer {
             // M-step
             self.m_step(read_kmer_counts, gc_values, &new_assignments);
 
-            // Merge similar clusters
-            self.merge_similar_clusters(read_kmer_counts, gc_values, merge_threshold);
+            // Merge similar clusters (only after iteration 3 to let profiles stabilize;
+            // merging too early when profiles are noisy can permanently collapse distinct clusters)
+            if iteration >= 3 {
+                self.merge_similar_clusters(read_kmer_counts, gc_values, merge_threshold);
+            }
 
             // Compute total log-likelihood
             let total_ll = self.compute_total_log_likelihood(read_kmer_counts);
