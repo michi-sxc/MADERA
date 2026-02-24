@@ -1,8 +1,8 @@
 //! MADERA Pipeline in Rust: Metagenomic Ancient DNA Evaluation and Reference-free Analysis
-//! 
+//!
 //! This program performs quality control, feature extraction (including k-mer frequencies,
-//! optional codon usage, GC content, and damage scores), incremental PCA with progress updates,
-//! and clustering using DBSCAN with spatial indexing (via a kd-tree) and parallel neighbor precomputation.
+//! optional codon usage, GC content, and damage scores), PCA dimensionality reduction,
+//! and clustering using HDBSCAN initial seeding with EM iterative refinement.
 //! 
 //! Michael Schneider 2026
 //! https://github.com/michi-sxc/MADERA
@@ -69,20 +69,12 @@ struct Args {
     #[arg(long, default_value_t = false)]
     dashboard: bool,
 
-    /// Minimum samples for DBSCAN (default: 5)
+    /// Minimum cluster size for HDBSCAN initial clustering (default: 5)
     #[arg(long, default_value_t = 5)]
     min_samples: usize,
 
-    /// Epsilon radius for DBSCAN clustering (default: 0.5)
-    #[arg(long, default_value_t = 0.5)]
-    eps: f64,
-
-    /// Automatically determine optimal epsilon using k-distance method
-    #[arg(long, default_value_t = false)]
-    auto_epsilon: bool,
-
-    /// Number of PCA components (default: 5)
-    #[arg(long, default_value_t = 5)]
+    /// Number of PCA components for dimensionality reduction (default: 8)
+    #[arg(long, default_value_t = 8)]
     pca_components: usize,
 
     /// Window size for damage assessment (default: 5)
@@ -2971,59 +2963,119 @@ fn precompute_kmer_counts(reads: &[Read], k: usize) -> Vec<Vec<u16>> {
         .collect()
 }
 
-/// Perform coarse initial clustering on the 18-dim robust feature matrix.
+/// Reduce feature matrix dimensionality via PCA for Phase 1 clustering.
 ///
-/// Uses existing DBSCAN infrastructure with auto-epsilon. This is Phase 1
-/// of the EM pipeline — the clusters don't need to be perfect, just good
-/// enough to bootstrap the EM iterations.
-///
-/// For 18 dimensions, the spatial index uses a KD-tree (the grid-based index
-/// is infeasible at D=18 due to O(3^18) neighbor cell enumeration).
-fn coarse_initial_clustering(
+/// Reduces the 18D robust feature space (GC + dinucleotides + length) to
+/// `n_components` dimensions (default 8). This mitigates curse-of-dimensionality
+/// effects in the subsequent HDBSCAN clustering while preserving >95% of
+/// the biological variance (GC content dominates PC1, dinucleotide patterns
+/// drive PCs 2-8).
+fn pca_reduce_features(
     features: &ndarray::Array2<f64>,
-    min_samples: usize,
-    eps: f64,
-    auto_epsilon: bool,
-) -> Vec<isize> {
-    let n_dims = features.ncols();
-    info!("Phase 1: Coarse clustering on {}-dim robust features ({} reads)",
-          n_dims, features.nrows());
+    n_components: usize,
+) -> ndarray::Array2<f64> {
+    use ndarray::Array2;
+    use ndarray_linalg::Eigh;
+    use ndarray_linalg::UPLO;
 
-    // Determine epsilon
-    let effective_eps = if auto_epsilon {
-        info!("Computing auto-epsilon for {}-dim initial features...", n_dims);
-        let k_distances = match n_dims {
-            2 => compute_k_distance_for_dim::<2>(features, min_samples),
-            3 => compute_k_distance_for_dim::<3>(features, min_samples),
-            4 => compute_k_distance_for_dim::<4>(features, min_samples),
-            5 => compute_k_distance_for_dim::<5>(features, min_samples),
-            18 => compute_k_distance_for_dim::<18>(features, min_samples),
-            _ => {
-                warn!("K-distance not implemented for {} dims, truncating to 5", n_dims);
-                let truncated = truncate_pca_dimensions(features, 5);
-                compute_k_distance_for_dim::<5>(&truncated, min_samples)
-            }
-        };
-        let optimal = find_optimal_eps(&k_distances);
-        info!("Auto-epsilon for initial clustering: {:.4}", optimal);
-        optimal
-    } else {
-        eps
-    };
+    let n_samples = features.nrows();
+    let n_features = features.ncols();
 
-    // Run DBSCAN
-    let clusters = match n_dims {
-        2 => optimized_dbscan::<2>(features, effective_eps, min_samples),
-        3 => optimized_dbscan::<3>(features, effective_eps, min_samples),
-        4 => optimized_dbscan::<4>(features, effective_eps, min_samples),
-        5 => optimized_dbscan::<5>(features, effective_eps, min_samples),
-        18 => optimized_dbscan::<18>(features, effective_eps, min_samples),
-        _ => {
-            warn!("DBSCAN not supported for {} dims, truncating to 5", n_dims);
-            let truncated = truncate_pca_dimensions(features, 5);
-            optimized_dbscan::<5>(&truncated, effective_eps, min_samples)
+    if n_features <= n_components || n_samples < 2 {
+        info!("PCA reduction skipped: {} features <= {} target components", n_features, n_components);
+        return features.clone();
+    }
+
+    let actual_components = n_components.min(n_features).min(n_samples);
+
+    // Compute mean
+    let mean = features.sum_axis(ndarray::Axis(0)) / n_samples as f64;
+
+    // Center data
+    let mut centered = features.clone();
+    for i in 0..n_samples {
+        for j in 0..n_features {
+            centered[[i, j]] -= mean[j];
+        }
+    }
+
+    // Compute covariance matrix
+    let cov = centered.t().dot(&centered) / (n_samples as f64 - 1.0);
+
+    // Eigendecomposition
+    let (eigenvalues, eigenvectors) = match cov.eigh(UPLO::Upper) {
+        Ok(eig) => eig,
+        Err(e) => {
+            warn!("PCA eigendecomposition failed: {:?}. Using unreduced features.", e);
+            return features.clone();
         }
     };
+
+    // Sort by descending eigenvalue and take top n_components
+    let mut eigen_pairs: Vec<(f64, usize)> = eigenvalues.iter()
+        .enumerate()
+        .map(|(i, &v)| (v, i))
+        .collect();
+    eigen_pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Build projection matrix (n_features × actual_components)
+    let mut projection = Array2::<f64>::zeros((n_features, actual_components));
+    let total_var: f64 = eigenvalues.iter().filter(|&&v| v > 0.0).sum();
+    let mut explained = 0.0;
+
+    for (i, &(val, idx)) in eigen_pairs.iter().take(actual_components).enumerate() {
+        projection.column_mut(i).assign(&eigenvectors.column(idx));
+        explained += val.max(0.0);
+    }
+
+    if total_var > 0.0 {
+        info!("PCA: {}D -> {}D ({:.1}% variance explained)",
+              n_features, actual_components, 100.0 * explained / total_var);
+    }
+
+    // Project: (n_samples × n_features) × (n_features × n_components) = (n_samples × n_components)
+    centered.dot(&projection)
+}
+
+/// Phase 1: HDBSCAN clustering on PCA-reduced robust features.
+///
+/// Replaces the original DBSCAN approach which suffered from
+/// curse-of-dimensionality in 18D. HDBSCAN uses mutual reachability
+/// distance and hierarchical density extraction, which naturally
+/// adapts to local density variations without requiring an epsilon parameter.
+fn hdbscan_initial_clustering(
+    features: &ndarray::Array2<f64>,
+    min_cluster_size: usize,
+) -> Vec<isize> {
+    use hdbscan::Hdbscan;
+
+    let n_reads = features.nrows();
+    let n_dims = features.ncols();
+    info!("Phase 1: HDBSCAN clustering on {}-dim features ({} reads, min_cluster_size={})",
+          n_dims, n_reads, min_cluster_size);
+
+    // Convert ndarray to Vec<Vec<f64>> for hdbscan crate
+    let data: Vec<Vec<f64>> = (0..n_reads)
+        .map(|i| features.row(i).to_vec())
+        .collect();
+
+    // Configure HDBSCAN
+    let hyper_params = hdbscan::HdbscanHyperParams::builder()
+        .min_cluster_size(min_cluster_size)
+        .build();
+    let clusterer = Hdbscan::new(&data, hyper_params);
+
+    // Run clustering
+    let labels = match clusterer.cluster() {
+        Ok(labels) => labels,
+        Err(e) => {
+            warn!("HDBSCAN failed: {:?}. Falling back to single cluster.", e);
+            return vec![0isize; n_reads];
+        }
+    };
+
+    // Convert i32 labels to isize
+    let clusters: Vec<isize> = labels.iter().map(|&l| l as isize).collect();
 
     let unique: HashSet<isize> = clusters.iter().cloned().collect();
     let noise = clusters.iter().filter(|&&c| c == -1).count();
@@ -3299,504 +3351,6 @@ fn incremental_pca(
 
 
 
-/// Optimized DBSCAN implementation using approximate nearest neighbors
-fn optimized_dbscan<const D: usize>(
-    data: &ndarray::Array2<f64>,
-    eps: f64,
-    min_samples: usize
-) -> Vec<isize> {
-    use indicatif::{ProgressBar, ProgressStyle};
-    use std::collections::VecDeque;
-    use rayon::prelude::*;
-    
-    let n_points = data.nrows();
-    let eps_sq = eps * eps;
-    
-    // Progress bar
-    let pb = ProgressBar::new(n_points as u64);
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}"
-        ).unwrap()
-        .progress_chars("##-")
-    );
-    pb.set_message("Building spatial index");
-    
-    // Convert data to appropriate format for spatial index
-    let mut points = Vec::with_capacity(n_points);
-    for i in 0..n_points {
-        let mut point = [0.0; D];
-        for j in 0..D {
-            point[j] = data[[i, j]];
-        }
-        points.push((i, point));
-    }
-    
-    // Build optimized spatial index
-    let spatial_index = build_optimized_spatial_index(&points, eps_sq);
-    pb.set_message("Finding neighbors");
-    
-    // Pre-compute neighbors for all points in parallel
-    let neighbors_list: Vec<Vec<usize>> = (0..n_points)
-        .into_par_iter()
-        .map(|i| {
-            if i % 1000 == 0 {
-                pb.set_position((i / 1000) as u64);
-            }
-            query_neighbors(&spatial_index, &points, i, eps_sq)
-        })
-        .collect();
-    
-    pb.set_message("Clustering points");
-    
-    // Run DBSCAN with pre-computed neighbors
-    let mut labels = vec![-1isize; n_points];
-    let mut cluster_id: isize = 0;
-    
-    for i in 0..n_points {
-        pb.set_position(i as u64);
-        
-        // Skip already classified points
-        if labels[i] != -1 {
-            continue;
-        }
-        
-        let neighbors = &neighbors_list[i];
-        
-        // Check if it's a core point
-        if neighbors.len() < min_samples {
-            continue; // Not a core point
-        }
-        
-        // Start a new cluster
-        cluster_id += 1;
-        labels[i] = cluster_id;
-        
-        // Process neighbors with breadth-first search
-        let mut queue = VecDeque::new();
-        for &n in neighbors {
-            if labels[n] == -1 { // Unclassified
-                queue.push_back(n);
-            }
-        }
-        
-        while let Some(current) = queue.pop_front() {
-            // Skip points already in a cluster
-            if labels[current] != -1 {
-                continue;
-            }
-            
-            // Add current point to cluster
-            labels[current] = cluster_id;
-            
-            // If current point is a core point, expand cluster
-            let current_neighbors = &neighbors_list[current];
-            if current_neighbors.len() >= min_samples {
-                for &neighbor in current_neighbors {
-                    if labels[neighbor] == -1 { // Unclassified
-                        queue.push_back(neighbor);
-                    }
-                }
-            }
-        }
-    }
-    
-    pb.finish_with_message("DBSCAN completed");
-    labels
-}
-
-/// Build optimized spatial index based on data dimensionality and size.
-///
-/// Strategy selection:
-/// - D > 10: Always use KD-tree. Grid-based index enumerates 3^D neighbor
-///   cells which is infeasible for high dimensions (3^18 = 387M cells).
-///   KD-trees degrade in high dims but remain functional.
-/// - D <= 10, small dataset: Grid index (low overhead, exact).
-/// - D <= 10, large dataset: KD-tree (O(n log n) construction, fast queries).
-fn build_optimized_spatial_index<const D: usize>(
-    points: &[(usize, [f64; D])],
-    eps_sq: f64
-) -> SpatialIndex<D> {
-    // Grid neighbor enumeration is O(3^D) — infeasible for D > 10
-    if D > 10 {
-        return build_tree_index(points);
-    }
-    // For small datasets in low dims, grid is simpler
-    if points.len() < 10000 || D > 5 {
-        return build_grid_index(points, eps_sq.sqrt());
-    }
-    // Large datasets in low dims: KD-tree
-    build_tree_index(points)
-}
-
-/// Build a grid-based spatial index for high-dimensional data
-fn build_grid_index<const D: usize>(
-    points: &[(usize, [f64; D])], 
-    cell_size: f64
-) -> SpatialIndex<D> {
-    use std::collections::HashMap;
-    
-    // Find data bounds
-    let mut min_vals = [f64::MAX; D];
-    let mut max_vals = [f64::MIN; D];
-    
-    for &(_, point) in points {
-        for d in 0..D {
-            min_vals[d] = min_vals[d].min(point[d]);
-            max_vals[d] = max_vals[d].max(point[d]);
-        }
-    }
-    
-    // Build grid cells
-    let mut grid: HashMap<Vec<isize>, Vec<usize>> = HashMap::new();
-    
-    for &(idx, point) in points {
-        let mut cell_coords = Vec::with_capacity(D);
-        for d in 0..D {
-            let coord = ((point[d] - min_vals[d]) / cell_size) as isize;
-            cell_coords.push(coord);
-        }
-        
-        grid.entry(cell_coords).or_default().push(idx);
-    }
-    
-    SpatialIndex::Grid { 
-        grid, 
-        min_vals, 
-        cell_size,
-    }
-}
-
-/// Build a tree-based spatial index for lower-dimensional data.
-///
-/// Deduplicates points before insertion to prevent kiddo's KdTree from panicking
-/// when too many points share identical coordinates on one axis. Points are grouped
-/// by quantized coordinates (1e-12 resolution); one representative per group is
-/// inserted into the tree, and the dedup_groups map is stored for expanding query
-/// results back to all original point indices.
-fn build_tree_index<const D: usize>(
-    points: &[(usize, [f64; D])]
-) -> SpatialIndex<D> {
-    use kiddo::float::kdtree::KdTree;
-    use std::collections::HashMap;
-    use std::sync::Arc;
-
-    const BUCKET_SIZE: usize = 32;
-
-    // Deduplicate: group points by quantized coordinates (1e-12 resolution).
-    // Points within 1e-12 on every axis are treated as identical.
-    let mut unique_map: HashMap<[i64; D], (usize, [f64; D], Vec<usize>)> = HashMap::new();
-
-    for &(idx, point) in points {
-        let mut key = [0i64; D];
-        for d in 0..D {
-            key[d] = (point[d] * 1e12) as i64;
-        }
-        unique_map.entry(key)
-            .and_modify(|entry| entry.2.push(idx))
-            .or_insert_with(|| (idx, point, vec![idx]));
-    }
-
-    let n_unique = unique_map.len();
-    if n_unique < points.len() {
-        info!("KdTree: deduplicated {} -> {} unique points ({:.1}% reduction)",
-              points.len(), n_unique,
-              100.0 * (1.0 - n_unique as f64 / points.len().max(1) as f64));
-    }
-
-    let mut tree = KdTree::<f64, usize, D, BUCKET_SIZE, u32>::new();
-    let mut dedup_groups: HashMap<usize, Vec<usize>> = HashMap::new();
-
-    // Add unique per-axis perturbation to each representative before insertion.
-    // kiddo panics when >BUCKET_SIZE points share the same value on ANY single axis
-    // (not just fully identical points). After z-score standardization, many reads can
-    // share axis values (e.g., same GC ratio, same read length). Adding idx*1e-10 to
-    // every axis ensures uniqueness. Max perturbation ~130K*1e-10 = 1.3e-5, negligible
-    // vs typical eps (~1.0). Queries use original (non-perturbed) coords, which is fine
-    // since the perturbation is far below eps.
-    for (insert_idx, (_, (repr_idx, repr_point, group))) in unique_map.iter().enumerate() {
-        let mut perturbed = *repr_point;
-        for d in 0..D {
-            perturbed[d] += (insert_idx as f64) * 1e-10;
-        }
-        tree.add(&perturbed, *repr_idx);
-        dedup_groups.insert(*repr_idx, group.clone());
-    }
-
-    SpatialIndex::KdTree {
-        tree: Arc::new(tree),
-        dedup_groups,
-    }
-}
-
-/// Query neighbors using the appropriate spatial index
-fn query_neighbors<const D: usize>(
-    index: &SpatialIndex<D>,
-    points: &[(usize, [f64; D])],
-    point_idx: usize,
-    eps_sq: f64
-) -> Vec<usize> {
-    match index {
-        SpatialIndex::Grid { grid, min_vals, cell_size } => {
-            // Grid-based neighbor query
-            let (_, point) = points[point_idx];
-            
-            // Calculate the grid cell containing the point
-            let mut cell_coords = Vec::with_capacity(D);
-            for d in 0..D {
-                let coord = ((point[d] - min_vals[d]) / cell_size) as isize;
-                cell_coords.push(coord);
-            }
-            
-            // Search neighboring cells
-            let mut candidates = Vec::new();
-            let mut neighbor_cells = Vec::new();
-            
-            // Generate neighboring cell coordinates
-            let mut coords = Vec::with_capacity(D);
-            generate_neighbor_cells::<D>(D, &cell_coords, &mut coords, &mut neighbor_cells);
-            
-            // Collect points from all neighboring cells
-            for cell in neighbor_cells {
-                if let Some(points_in_cell) = grid.get(&cell) {
-                    candidates.extend(points_in_cell);
-                }
-            }
-            
-            // Filter candidates by actual distance
-            candidates
-                .into_iter()
-                .filter(|&idx| {
-                    if idx == point_idx { return true; }
-                    
-                    let (_, other_point) = points[idx];
-                    squared_euclidean(&point, &other_point) <= eps_sq
-                })
-                .collect()
-        },
-        SpatialIndex::KdTree { tree, dedup_groups } => {
-            // KD-tree-based neighbor query with dedup expansion
-            use kiddo::float::distance::SquaredEuclidean;
-
-            let (_, point) = points[point_idx];
-
-            let raw_results = tree.within::<SquaredEuclidean>(&point, eps_sq);
-            let mut expanded = Vec::new();
-            for nn in raw_results {
-                if let Some(group) = dedup_groups.get(&nn.item) {
-                    expanded.extend(group.iter().copied());
-                } else {
-                    expanded.push(nn.item);
-                }
-            }
-            expanded
-        }
-    }
-}
-
-/// Calculate squared Euclidean distance between two points
-fn squared_euclidean<const D: usize>(p1: &[f64; D], p2: &[f64; D]) -> f64 {
-    let mut sum = 0.0;
-    for d in 0..D {
-        let diff = p1[d] - p2[d];
-        sum += diff * diff;
-    }
-    sum
-}
-
-/// Generate all neighboring cell coordinates recursively
-fn generate_neighbor_cells<const D: usize>(
-    dim: usize,
-    center: &[isize],
-    current: &mut Vec<isize>,
-    result: &mut Vec<Vec<isize>>
-) {
-    if current.len() == dim {
-        result.push(current.clone());
-        return;
-    }
-    
-    let d = current.len();
-    let center_coord = center[d];
-    
-    // Only check adjacent cells (current, previous, next)
-    for offset in -1..=1 {
-        current.push(center_coord + offset);
-        generate_neighbor_cells::<D>(dim, center, current, result);
-        current.pop();
-    }
-}
-
-/// Unified spatial index enum to support different index types
-enum SpatialIndex<const D: usize> {
-    Grid {
-        grid: std::collections::HashMap<Vec<isize>, Vec<usize>>,
-        min_vals: [f64; D],
-        cell_size: f64,
-    },
-    KdTree {
-        tree: std::sync::Arc<kiddo::float::kdtree::KdTree<f64, usize, D, 32, u32>>,
-        /// Maps representative point index -> all point indices sharing that position.
-        /// Used to expand query results after deduplication.
-        dedup_groups: std::collections::HashMap<usize, Vec<usize>>,
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/// Function to execute DBSCAN clustering for different dimensions
-#[allow(dead_code)]
-fn dbscan_clustering<const D: usize>(
-    data: &ndarray::Array2<f64>,
-    eps: f64,
-    min_samples: usize
-) -> Vec<isize> where [(); D]: DimensionalDBSCAN {
-    <[(); D]>::dbscan_clustering(data, eps, min_samples)
-}
-
-// Add this 1D clustering implementation
-fn cluster_1d(data: &Array2<f64>, eps: f64, min_samples: usize) -> Vec<isize> {
-    use std::collections::HashMap;
-    
-    let n_points = data.nrows();
-    let mut clusters = vec![-1isize; n_points];
-    
-    // Extract the 1D values and their indices
-    let mut values_with_indices: Vec<(f64, usize)> = Vec::with_capacity(n_points);
-    for i in 0..n_points {
-        values_with_indices.push((data[[i, 0]], i));
-    }
-    
-    // Sort by value for efficient neighbor finding
-    values_with_indices.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    
-    // Create a mapping from original index to sorted index
-    let mut index_map = HashMap::with_capacity(n_points);
-    for (sorted_idx, &(_, original_idx)) in values_with_indices.iter().enumerate() {
-        index_map.insert(original_idx, sorted_idx);
-    }
-    
-    // Main clustering algorithm
-    let mut cluster_id = 0;
-    
-    for i in 0..n_points {
-        if clusters[i] != -1 {
-            continue; // Skip points already assigned to clusters
-        }
-        
-        // Find neighbors efficiently using binary search in the sorted array
-        let sorted_idx = *index_map.get(&i).unwrap();
-        let value = values_with_indices[sorted_idx].0;
-        
-        // Find neighbors using a linear scan in the sorted array 
-        // (more efficient than checking every point in 1D)
-        let mut neighbors = Vec::new();
-        
-        // Search left
-        let mut left_idx = sorted_idx;
-        while left_idx > 0 {
-            left_idx -= 1;
-            let neighbor_value = values_with_indices[left_idx].0;
-            if (value - neighbor_value).abs() <= eps {
-                neighbors.push(values_with_indices[left_idx].1);
-            } else {
-                break; // No more neighbors in this direction
-            }
-        }
-        
-        // Search right
-        let mut right_idx = sorted_idx;
-        while right_idx < n_points - 1 {
-            right_idx += 1;
-            let neighbor_value = values_with_indices[right_idx].0;
-            if (value - neighbor_value).abs() <= eps {
-                neighbors.push(values_with_indices[right_idx].1);
-            } else {
-                break; // No more neighbors in this direction
-            }
-        }
-        
-        // Include the point itself
-        neighbors.push(i);
-        
-        // Check if it's a core point
-        if neighbors.len() < min_samples {
-            continue; // Not a core point
-        }
-        
-        // Create a new cluster
-        cluster_id += 1;
-        
-        // Process all neighbors
-        let mut to_process = neighbors.clone();
-        clusters[i] = cluster_id; // Mark the current point
-        
-        while let Some(current) = to_process.pop() {
-            // Skip already processed points
-            if clusters[current] != -1 {
-                continue;
-            }
-            
-            // Add current point to cluster
-            clusters[current] = cluster_id;
-            
-            // Find neighbors of current point
-            let current_sorted_idx = *index_map.get(&current).unwrap();
-            let current_value = values_with_indices[current_sorted_idx].0;
-            
-            let mut current_neighbors = Vec::new();
-            
-            // Search left
-            let mut left_idx = current_sorted_idx;
-            while left_idx > 0 {
-                left_idx -= 1;
-                let neighbor_value = values_with_indices[left_idx].0;
-                if (current_value - neighbor_value).abs() <= eps {
-                    current_neighbors.push(values_with_indices[left_idx].1);
-                } else {
-                    break;
-                }
-            }
-            
-            // Search right
-            let mut right_idx = current_sorted_idx;
-            while right_idx < n_points - 1 {
-                right_idx += 1;
-                let neighbor_value = values_with_indices[right_idx].0;
-                if (current_value - neighbor_value).abs() <= eps {
-                    current_neighbors.push(values_with_indices[right_idx].1);
-                } else {
-                    break;
-                }
-            }
-            
-            // If it's a core point, add its neighbors to processing queue
-            if current_neighbors.len() >= min_samples {
-                for &neighbor in &current_neighbors {
-                    if clusters[neighbor] == -1 {
-                        to_process.push(neighbor);
-                    }
-                }
-            }
-        }
-    }
-    
-    clusters
-}
 
 /// Compute fs for each cluster
 fn compute_cluster_stats(
@@ -3950,7 +3504,7 @@ async fn run_dashboard(
     gc_scores: HashMap<String, f64>,
     damage_scores: HashMap<String, DamageScore>,
     read_ids: Vec<String>,
-    min_samples: usize,
+    _min_samples: usize,
     eigenvalues: Vec<f64>,
     total_features: usize,
 ) -> std::io::Result<()> {
@@ -3980,9 +3534,9 @@ async fn run_dashboard(
         dam3_vec.push(dscore.damage3);
     }
     
-    // Compute k-distance and find optimal epsilon
-    let k_distance = compute_k_distance_data(&pca_results, min_samples);
-    let optimal_eps = find_optimal_eps(&k_distance);
+    // K-distance plot data (legacy DBSCAN feature, no longer computed with HDBSCAN)
+    let k_distance: Vec<f64> = Vec::new();
+    let optimal_eps = 0.0f64;
     
     // Compute cluster statistics
     let unique_clusters: Vec<isize> = clusters.iter()
@@ -4789,446 +4343,7 @@ r#"<!DOCTYPE html>
     HttpResponse::Ok().content_type("text/html").body(html)
 }
 
-/// DBSCAN clustering implementation
-/// This handles potential dimensional mismatches and optimizes the clustering algorithm
 
-/// Dynamic dimensional DBSCAN implementation using a trait to handle different dimensions
-pub trait DimensionalDBSCAN {
-    fn dbscan_clustering(data: &ndarray::Array2<f64>, eps: f64, min_samples: usize) -> Vec<isize>;
-}
-
-// Implementation for different PCA dimensions
-macro_rules! impl_dbscan_for_dim {
-    ($dim:expr) => {
-        impl DimensionalDBSCAN for [(); $dim] {
-            fn dbscan_clustering(data: &ndarray::Array2<f64>, eps: f64, min_samples: usize) -> Vec<isize> {
-                // Ensure data dimensions match the expected dimension
-                assert!(data.ncols() == $dim, "Data dimensions ({}) don't match the expected dimension ({})", 
-                       data.ncols(), $dim);
-                
-                use indicatif::{ProgressBar, ProgressStyle};
-                use std::collections::{VecDeque, HashMap, HashSet};
-                use kiddo::float::kdtree::KdTree;
-                use kiddo::float::distance::SquaredEuclidean;
-                use std::cmp::min;
-                
-                const B: usize = 256; // Bucket size for KdTree (unchanged)
-                let n_points = data.nrows();
-                let eps_sq = eps * eps; // Consistent squaring of epsilon
-                
-                // Progress bar for tree building
-                let pb = ProgressBar::new(n_points as u64);
-                pb.set_style(
-                    ProgressStyle::with_template(
-                        "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({percent}%) - {msg}"
-                    ).unwrap()
-                    .progress_chars("##-")
-                );
-                pb.set_message("Building kd-tree");
-                
-                // Build the KdTree
-                let mut tree = KdTree::<f64, u64, $dim, B, u32>::new();
-                
-                for i in 0..n_points {
-                    // Convert ndarray row to fixed-size array
-                    let point = data.row(i);
-                    let mut point_arr = [0.0; $dim];
-                    for j in 0..$dim {
-                        point_arr[j] = point[j];
-                    }
-                    // Add unique per-axis perturbation to prevent kiddo panic when
-                    // too many points share the same value on a single axis.
-                    for d in 0..$dim {
-                        point_arr[d] += (i as f64) * 1e-10;
-                    }
-                    tree.add(&point_arr, i as u64);
-
-                    if i % 1000 == 0 {
-                        pb.set_position(i as u64);
-                    }
-                }
-                pb.finish_with_message("kd-tree built");
-                
-                // Neighbor cache with LRU-like functionality
-                struct NeighborCache {
-                    cache: HashMap<usize, Vec<usize>>,
-                    max_size: usize,
-                    recently_used: VecDeque<usize>,
-                }
-                
-                impl NeighborCache {
-                    fn new(max_size: usize) -> Self {
-                        Self {
-                            cache: HashMap::with_capacity(max_size),
-                            max_size,
-                            recently_used: VecDeque::with_capacity(max_size),
-                        }
-                    }
-                    
-                    fn get(&mut self, key: usize) -> Option<&Vec<usize>> {
-                        if self.cache.contains_key(&key) {
-                            // Move to end of recently used
-                            if let Some(pos) = self.recently_used.iter().position(|&x| x == key) {
-                                self.recently_used.remove(pos);
-                            }
-                            self.recently_used.push_back(key);
-                            Some(&self.cache[&key])
-                        } else {
-                            None
-                        }
-                    }
-                    
-                    fn insert(&mut self, key: usize, value: Vec<usize>) {
-                        // Evict least recently used item if full
-                        if self.cache.len() >= self.max_size && !self.cache.contains_key(&key) {
-                            if let Some(oldest) = self.recently_used.pop_front() {
-                                self.cache.remove(&oldest);
-                            }
-                        }
-                        
-                        self.cache.insert(key, value);
-                        self.recently_used.push_back(key);
-                    }
-                }
-                
-                // Initialize DBSCAN structures
-                let mut labels = vec![-1isize; n_points];
-                let mut cluster_id: isize = 0;
-                let mut neighbor_cache = NeighborCache::new(min(10000, n_points / 10)); // Adaptive cache size
-                
-                // Progress bar for DBSCAN
-                let pb = ProgressBar::new(n_points as u64);
-                pb.set_style(
-                    ProgressStyle::with_template(
-                        "[{elapsed_precise}] [{bar:40.green/black}] {pos}/{len} ({percent}%) - {msg}"
-                    ).unwrap()
-                    .progress_chars("##-")
-                );
-                pb.set_message("Running DBSCAN");
-                
-                // Optimized single-pass DBSCAN implementation
-                for i in 0..n_points {
-                    pb.set_position(i as u64);
-                    
-                    // Skip already classified points
-                    if labels[i] != -1 {
-                        continue;
-                    }
-                    
-                    // Get neighbors using the cache or compute fresh
-                    let neighbors = if let Some(cached) = neighbor_cache.get(i) {
-                        cached.clone()
-                    } else {
-                        let point = data.row(i);
-                        let mut point_arr = [0.0; $dim];
-                        for j in 0..$dim {
-                            point_arr[j] = point[j];
-                        }
-                        
-                        let new_neighbors: Vec<usize> = tree
-                            .within::<SquaredEuclidean>(&point_arr, eps_sq)
-                            .into_iter()
-                            .map(|nn| nn.item as usize)
-                            .collect();
-                        
-                        neighbor_cache.insert(i, new_neighbors.clone());
-                        new_neighbors
-                    };
-                    
-                    // Check if point is a core point
-                    if neighbors.len() < min_samples {
-                        labels[i] = -2; // Mark as noise temporarily
-                        continue;
-                    }
-                    
-                    // Start a new cluster
-                    cluster_id += 1;
-                    labels[i] = cluster_id;
-                    
-                    // Process neighbors with breadth-first expansion
-                    let mut seeds = VecDeque::from(neighbors);
-                    let mut processed = HashSet::new();
-                    processed.insert(i);
-                    
-                    while let Some(current) = seeds.pop_front() {
-                        // Skip already processed points
-                        if processed.contains(&current) {
-                            continue;
-                        }
-                        processed.insert(current);
-                        
-                        // Skip points already in a cluster
-                        if labels[current] > 0 {
-                            continue;
-                        }
-                        
-                        // Add current point to cluster
-                        labels[current] = cluster_id;
-                        
-                        // Get neighbors of current point
-                        let current_neighbors = if let Some(cached) = neighbor_cache.get(current) {
-                            cached.clone()
-                        } else {
-                            let point = data.row(current);
-                            let mut point_arr = [0.0; $dim];
-                            for j in 0..$dim {
-                                point_arr[j] = point[j];
-                            }
-                            
-                            let new_neighbors: Vec<usize> = tree
-                                .within::<SquaredEuclidean>(&point_arr, eps_sq)
-                                .into_iter()
-                                .map(|nn| nn.item as usize)
-                                .collect();
-                            
-                            neighbor_cache.insert(current, new_neighbors.clone());
-                            new_neighbors
-                        };
-                        
-                        // If current point is a core point, add its neighbors to seeds
-                        if current_neighbors.len() >= min_samples {
-                            for &neighbor in &current_neighbors {
-                                if !processed.contains(&neighbor) {
-                                    seeds.push_back(neighbor);
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // Final pass - reclassify noise points (-2) as true noise (-1)
-                labels.iter_mut().for_each(|label| {
-                    if *label == -2 {
-                        *label = -1;
-                    }
-                });
-                
-                pb.finish_with_message("DBSCAN completed");
-                labels
-            }
-        }
-    };
-}
-
-// Implement for common PCA dimensions
-impl_dbscan_for_dim!(2);
-impl_dbscan_for_dim!(3);
-impl_dbscan_for_dim!(4);
-impl_dbscan_for_dim!(5);
-impl_dbscan_for_dim!(6);
-impl_dbscan_for_dim!(7);
-impl_dbscan_for_dim!(8);
-impl_dbscan_for_dim!(9);
-impl_dbscan_for_dim!(10);
-impl_dbscan_for_dim!(18);
-impl_dbscan_for_dim!(20);
-
-
-/// Wrapper function to call the correct implementation based on dimensions
-#[allow(dead_code)]
-pub fn dynamic_dbscan_clustering(data: &ndarray::Array2<f64>, eps: f64, min_samples: usize) -> Vec<isize> {
-    match data.ncols() {
-        2 => <[(); 2]>::dbscan_clustering(data, eps, min_samples),
-        3 => <[(); 3]>::dbscan_clustering(data, eps, min_samples),
-        4 => <[(); 4]>::dbscan_clustering(data, eps, min_samples),
-        5 => <[(); 5]>::dbscan_clustering(data, eps, min_samples),
-        6 => <[(); 6]>::dbscan_clustering(data, eps, min_samples),
-        7 => <[(); 7]>::dbscan_clustering(data, eps, min_samples),
-        8 => <[(); 8]>::dbscan_clustering(data, eps, min_samples),
-        9 => <[(); 9]>::dbscan_clustering(data, eps, min_samples),
-        10 => <[(); 10]>::dbscan_clustering(data, eps, min_samples),
-        18 => <[(); 18]>::dbscan_clustering(data, eps, min_samples),
-        20 => <[(); 20]>::dbscan_clustering(data, eps, min_samples),
-        _ => panic!("Unsupported dimension: {}. Add implementation for this dimension.", data.ncols()),
-    }
-}
-
-/// Implement an improved elbow detection algorithm for k-distance data
-/// using the "knee detection" method that's robust to outliers
-pub fn find_optimal_eps(k_distances: &[f64]) -> f64 {
-    // Sort distances
-    let mut sorted_distances = k_distances.to_vec();
-    sorted_distances.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    
-    // Filter outliers by removing the top 2.5% that may skew the elbow detection
-    let n = sorted_distances.len();
-    let outlier_threshold_idx = (n as f64 * 0.975) as usize;
-    let filtered_distances = &sorted_distances[0..std::cmp::min(outlier_threshold_idx, n)];
-    
-    if filtered_distances.len() < 3 {
-        return sorted_distances[n / 2]; // Median as fallback for very small datasets
-    }
-    
-    // Normalize both x and y to [0, 1] for consistent processing
-    let x_norm: Vec<f64> = (0..filtered_distances.len())
-        .map(|i| i as f64 / (filtered_distances.len() as f64 - 1.0))
-        .collect();
-    
-    let min_dist = *filtered_distances.first().unwrap();
-    let max_dist = *filtered_distances.last().unwrap();
-    let range = max_dist - min_dist;
-    
-    if range < 1e-6 {
-        // If all distances are nearly identical, return the median
-        return filtered_distances[filtered_distances.len() / 2];
-    }
-    
-    let y_norm: Vec<f64> = filtered_distances.iter()
-        .map(|&d| (d - min_dist) / range)
-        .collect();
-    
-    // Get the coordinates of the start and end points for the line
-    let start_x = x_norm[0];
-    let start_y = y_norm[0];
-    let end_x = x_norm[x_norm.len() - 1];
-    let end_y = y_norm[y_norm.len() - 1];
-    
-    // Find the point that maximizes the distance to the line from start to end point
-    // This is the core of the "knee/elbow detection" algorithm
-    let mut max_distance = 0.0;
-    let mut knee_idx = 0;
-    
-    for i in 1..x_norm.len() - 1 {
-        // Distance from point to line calculation
-        let x0 = x_norm[i];
-        let y0 = y_norm[i];
-        
-        // Line equation parameters: ax + by + c = 0
-        let a = end_y - start_y;
-        let b = start_x - end_x;
-        let c = end_x * start_y - start_x * end_y;
-        
-        // Distance from point to line formula
-        let distance = (a * x0 + b * y0 + c).abs() / (a * a + b * b).sqrt();
-        
-        if distance > max_distance {
-            max_distance = distance;
-            knee_idx = i;
-        }
-    }
-    
-    // Also implement a slope-based detection as a sanity check
-    let mut significant_slope_change_idx = 0;
-    let mut max_diff = 0.0;
-    
-    // Find point where slope changes most dramatically
-    for i in 1..y_norm.len() - 1 {
-        let prev_slope = y_norm[i] - y_norm[i-1];
-        let next_slope = y_norm[i+1] - y_norm[i];
-        let slope_diff = next_slope - prev_slope;
-        
-        if slope_diff > max_diff {
-            max_diff = slope_diff;
-            significant_slope_change_idx = i;
-        }
-    }
-    
-    // Choose between methods - prefer knee method but validate with slope method
-    let chosen_idx = if (knee_idx as isize - significant_slope_change_idx as isize).abs() < (filtered_distances.len() as isize / 4) {
-        // Both methods agree (within 25% of the data range), use knee method
-        knee_idx
-    } else if knee_idx < significant_slope_change_idx {
-        // Prefer earlier elbow point to avoid being influenced by late outliers
-        knee_idx
-    } else {
-        // Default to slope-based method as it tends to be more conservative
-        significant_slope_change_idx
-    };
-    
-    // Map back to original distance value
-    let elbow_value = filtered_distances[chosen_idx];
-    
-    // Debug output
-    log::info!("Elbow detection: knee_method={:.4}, slope_method={:.4}, chosen={:.4}", 
-              filtered_distances[knee_idx], 
-              filtered_distances[significant_slope_change_idx], 
-              elbow_value);
-    
-    elbow_value
-}
-
-/// Compute k-distance data for dimensional-aware DBSCAN
-pub fn compute_k_distance_data(data: &ndarray::Array2<f64>, k: usize) -> Vec<f64> {
-    match data.ncols() {
-        2 => compute_k_distance_for_dim::<2>(data, k),
-        3 => compute_k_distance_for_dim::<3>(data, k),
-        4 => compute_k_distance_for_dim::<4>(data, k),
-        5 => compute_k_distance_for_dim::<5>(data, k),
-        6 => compute_k_distance_for_dim::<6>(data, k),
-        7 => compute_k_distance_for_dim::<7>(data, k),
-        8 => compute_k_distance_for_dim::<8>(data, k),
-        9 => compute_k_distance_for_dim::<9>(data, k),
-        10 => compute_k_distance_for_dim::<10>(data, k),
-        18 => compute_k_distance_for_dim::<18>(data, k),
-        20 => compute_k_distance_for_dim::<20>(data, k),
-        _ => panic!("Unsupported dimension: {}. Add implementation for this dimension.", data.ncols()),
-    }
-}
-
-/// K-distance computation for a specific dimension
-fn compute_k_distance_for_dim<const D: usize>(data: &ndarray::Array2<f64>, k: usize) -> Vec<f64> {
-    use kiddo::float::kdtree::KdTree;
-    use kiddo::float::distance::SquaredEuclidean;
-    use std::collections::HashMap;
-
-    const B: usize = 256; // Bucket size
-    let n_points = data.nrows();
-
-    // Deduplicate points before KdTree insertion to prevent panic on identical coordinates.
-    // Same approach as build_tree_index: quantize to 1e-12 resolution, insert one representative.
-    let mut unique_map: HashMap<[i64; D], (usize, [f64; D], Vec<usize>)> = HashMap::new();
-
-    for i in 0..n_points {
-        let mut point_arr = [0.0; D];
-        let mut key = [0i64; D];
-        for j in 0..D {
-            point_arr[j] = data[[i, j]];
-            key[j] = (data[[i, j]] * 1e12) as i64;
-        }
-        unique_map.entry(key)
-            .and_modify(|entry| entry.2.push(i))
-            .or_insert_with(|| (i, point_arr, vec![i]));
-    }
-
-    let mut tree = KdTree::<f64, u64, D, B, u32>::new();
-
-    // Add unique per-axis perturbation to prevent kiddo panic on same-axis collisions.
-    // Same rationale as build_tree_index: after z-score standardization, many points
-    // share values on individual axes (e.g., same GC ratio, same read length).
-    for (insert_idx, (_, (repr_idx, repr_point, _group))) in unique_map.iter().enumerate() {
-        let mut perturbed = *repr_point;
-        for d in 0..D {
-            perturbed[d] += (insert_idx as f64) * 1e-10;
-        }
-        tree.add(&perturbed, *repr_idx as u64);
-    }
-
-    let mut kth_distances = Vec::with_capacity(n_points);
-
-    // For each point, retrieve its k nearest neighbors.
-    // The deduplicated tree has exactly one representative per group, so the self-match
-    // is always 1 entry (not group_size). We request k+1 neighbors and take index [k].
-    for i in 0..n_points {
-        let mut point_arr = [0.0; D];
-        for j in 0..D {
-            point_arr[j] = data[[i, j]];
-        }
-
-        // Request k+1 neighbors: +1 for the self-match (only 1 representative in tree)
-        let neighbors = tree.nearest_n::<SquaredEuclidean>(&point_arr, k + 1);
-
-        if neighbors.len() > k {
-            // k+1th neighbor (skip self at index 0) gives the k-distance
-            let kth_sq = neighbors[k].distance;
-            kth_distances.push(kth_sq.sqrt());
-        } else {
-            let furthest = neighbors.last().map(|n| n.distance.sqrt()).unwrap_or(0.0);
-            kth_distances.push(furthest);
-        }
-    }
-
-    kth_distances
-}
 
 /// Main function
 fn main() {
@@ -5257,9 +4372,7 @@ fn main() {
         output: matches.get_one::<String>("output").unwrap_or(&String::from("cluster_report.csv")).clone(),
         dashboard: matches.get_flag("dashboard"),
         min_samples: matches.get_one::<String>("min_samples").unwrap_or(&String::from("5")).parse().unwrap_or(5),
-        eps: matches.get_one::<String>("eps").unwrap_or(&String::from("0.5")).parse().unwrap_or(0.5),
-        auto_epsilon: matches.get_flag("auto_epsilon"),
-        pca_components: matches.get_one::<String>("pca_components").unwrap_or(&String::from("5")).parse().unwrap_or(5),
+        pca_components: matches.get_one::<String>("pca_components").unwrap_or(&String::from("8")).parse().unwrap_or(8),
         damage_window: matches.get_one::<String>("damage_window").unwrap_or(&String::from("5")).parse().unwrap_or(5),
         sim_threshold: matches.get_one::<String>("sim_threshold").unwrap_or(&String::from("0.5")).parse().unwrap_or(0.5),
         conf_threshold: matches.get_one::<String>("conf_threshold").unwrap_or(&String::from("0.1")).parse().unwrap_or(0.1),
@@ -5291,10 +4404,6 @@ fn main() {
     
     if args.min_length < 20 {
         info!("Warning: Min read length of {} may include low-quality reads", args.min_length);
-    }
-    
-    if args.auto_epsilon && args.eps != 0.5 {
-        info!("Both --auto-epsilon and --eps provided. Automatic epsilon selection will be used.");
     }
     
     // Start timing the pipeline
@@ -5450,8 +4559,8 @@ fn setup_cli() -> Command {
         .arg(
             Arg::new("pca_components")
                 .long("pca_components")
-                .help(format!("{}: Number of PCA components", "Dimensionality Reduction".bright_blue().bold()))
-                .default_value("5")
+                .help(format!("{}: Number of PCA components for dimensionality reduction", "Dimensionality Reduction".bright_blue().bold()))
+                .default_value("8")
                 .num_args(1)
                 .value_name("INT")
         )
@@ -5467,31 +4576,15 @@ fn setup_cli() -> Command {
         .group(
             ArgGroup::new("clustering")
                 .arg("min_samples")
-                .arg("eps")
-                .arg("auto_epsilon")
                 .multiple(true)
         )
         .arg(
             Arg::new("min_samples")
                 .long("min_samples")
-                .help(format!("{}: Minimum samples for DBSCAN clustering", "Clustering".bright_blue().bold()))
+                .help(format!("{}: Minimum cluster size for HDBSCAN initial clustering", "Clustering".bright_blue().bold()))
                 .default_value("5")
                 .num_args(1)
                 .value_name("INT")
-        )
-        .arg(
-            Arg::new("eps")
-                .long("eps")
-                .help(format!("{}: Epsilon radius for DBSCAN clustering", "Clustering".bright_blue().bold()))
-                .default_value("0.5")
-                .num_args(1)
-                .value_name("FLOAT")
-        )
-        .arg(
-            Arg::new("auto_epsilon")
-                .long("auto_epsilon")
-                .help(format!("{}: Automatically determine optimal epsilon using k-distance method", "Clustering".bright_blue().bold()))
-                .action(clap::ArgAction::SetTrue)
         )
         // Taxonomy group
         .group(
@@ -5611,7 +4704,7 @@ fn setup_cli() -> Command {
             Arg::new("merge_threshold")
                 .long("merge-threshold")
                 .help(format!("{}: Jensen-Shannon divergence threshold for merging similar clusters", "EM Clustering".bright_blue().bold()))
-                .default_value("0.01")
+                .default_value("0.05")
                 .num_args(1)
                 .value_name("FLOAT")
         )
@@ -5636,7 +4729,7 @@ fn setup_cli() -> Command {
                 .action(clap::ArgAction::SetTrue)
         )
         // Add examples section
-        .after_help(format!("{}:\n  {} --fastq samples.fastq --min_length 50 --k 3 --auto_epsilon\n  {} --fastq samples.fastq --dashboard --batch_size 5000 --pca_components 3\n  {} --bam samples.bam --bam-filter unmapped --min_length 35\n  {} --bam samples.bam --bam-filter mapped --damage_threshold 0.7\n  {} --fastq samples.fastq --export-clusters --export-min-size 50 --export-format fasta\n  {} --bam samples.bam --export-clusters --export-min-size 100 --export-output clusters.zip",
+        .after_help(format!("{}:\n  {} --fastq samples.fastq --min_length 50 --k 3\n  {} --fastq samples.fastq --dashboard --batch_size 5000 --pca_components 3\n  {} --bam samples.bam --bam-filter unmapped --min_length 35\n  {} --bam samples.bam --bam-filter mapped --damage_threshold 0.7\n  {} --fastq samples.fastq --export-clusters --export-min-size 50 --export-format fasta\n  {} --bam samples.bam --export-clusters --export-min-size 100 --export-output clusters.zip",
             "Examples".underline().cyan(),
             "madera_pipeline".green(),
             "madera_pipeline".green(),
@@ -5932,59 +5025,12 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             return Err("PCA resulted in zero dimensions. Cannot perform clustering.".into());
         }
 
-        let cluster_dimensions = std::cmp::min(actual_dimensions, args.pca_components);
+        // Legacy pipeline now uses HDBSCAN (DBSCAN code removed in v0.4.0)
+        let hdbscan_min_cluster = std::cmp::max(5, args.min_samples);
+        info!("Legacy pipeline: HDBSCAN clustering on PCA results ({} dims, min_cluster_size={})",
+              actual_dimensions, hdbscan_min_cluster);
 
-        // Epsilon selection
-        let eps = if args.auto_epsilon {
-            info!("Calculating optimal epsilon using k-distance method...");
-            let k_distances = match cluster_dimensions {
-                1 => compute_k_distance_for_dim::<1>(&pca_results, args.min_samples),
-                2 => compute_k_distance_for_dim::<2>(&pca_results, args.min_samples),
-                3 => compute_k_distance_for_dim::<3>(&pca_results, args.min_samples),
-                4 => compute_k_distance_for_dim::<4>(&pca_results, args.min_samples),
-                5 => compute_k_distance_for_dim::<5>(&pca_results, args.min_samples),
-                _ => {
-                    warn!("K-distance not implemented for {} dims. Using first 5.", actual_dimensions);
-                    let truncated = truncate_pca_dimensions(&pca_results, 5);
-                    compute_k_distance_for_dim::<5>(&truncated, args.min_samples)
-                }
-            };
-            let optimal_eps = find_optimal_eps(&k_distances);
-            info!("Automatically determined epsilon: {:.4} (user provided: {:.4})",
-                  optimal_eps, args.eps);
-            optimal_eps
-        } else {
-            info!("Using user-specified epsilon: {:.4}", args.eps);
-            args.eps
-        };
-
-        // DBSCAN clustering
-        info!("Clustering reads with DBSCAN (eps: {:.4}, min_samples: {}, dimensions: {})...",
-              eps, args.min_samples, cluster_dimensions);
-
-        let clusters = if cluster_dimensions == 1 {
-            info!("Using 1D clustering algorithm");
-            cluster_1d(&pca_results, eps, args.min_samples)
-        } else {
-            match cluster_dimensions {
-                2 => optimized_dbscan::<2>(&pca_results, eps, args.min_samples),
-                3 => optimized_dbscan::<3>(&pca_results, eps, args.min_samples),
-                4 => optimized_dbscan::<4>(&pca_results, eps, args.min_samples),
-                5 => optimized_dbscan::<5>(&pca_results, eps, args.min_samples),
-                _ => {
-                    warn!("DBSCAN not supported for {} dims. Using first 5.", cluster_dimensions);
-                    let truncated = truncate_pca_dimensions(&pca_results, 5);
-                    optimized_dbscan::<5>(&truncated, eps, args.min_samples)
-                }
-            }
-        };
-
-        // Cluster statistics
-        let unique_clusters: HashSet<isize> = clusters.iter().cloned().collect();
-        let noise_count = clusters.iter().filter(|&&c| c == -1).count();
-        let cluster_count = unique_clusters.len() - (if noise_count > 0 { 1 } else { 0 });
-        info!("DBSCAN complete. Found {} clusters and {} noise points ({:.1}%)",
-              cluster_count, noise_count, 100.0 * noise_count as f64 / clusters.len() as f64);
+        let clusters = hdbscan_initial_clustering(&pca_results, hdbscan_min_cluster);
 
         info!("Computing cluster statistics...");
         let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
@@ -6045,7 +5091,7 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
 
     } else {
         // =====================================================================
-        // EM PIPELINE (v0.4.0): Robust features → DBSCAN Phase 1 → EM refinement
+        // EM PIPELINE (v0.4.0): Robust features → HDBSCAN Phase 1 → EM refinement
         // =====================================================================
         info!("Running EM iterative clustering pipeline (v0.4.0)");
 
@@ -6104,14 +5150,13 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         info!("Initial feature matrix: {} × {} (sequences × features)",
               initial_features.nrows(), initial_features.ncols());
 
-        // Phase 1: Coarse DBSCAN clustering on robust features
-        // Use a smaller min_samples for the coarse step (we want many small clusters)
-        let coarse_min_samples = std::cmp::max(3, args.min_samples / 2);
-        let initial_clusters = coarse_initial_clustering(
-            &initial_features,
-            coarse_min_samples,
-            args.eps,
-            args.auto_epsilon,
+        // Phase 1: PCA reduction + HDBSCAN clustering on robust features
+        let reduced_features = pca_reduce_features(&initial_features, args.pca_components);
+
+        let hdbscan_min_cluster = std::cmp::max(5, args.min_samples);
+        let initial_clusters = hdbscan_initial_clustering(
+            &reduced_features,
+            hdbscan_min_cluster,
         );
 
         // Phase 2-4: Compute k=4 count vectors and run EM
@@ -6227,24 +5272,6 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
-}
-
-/// Helper function to truncate PCA results to a lower dimension
-fn truncate_pca_dimensions(data: &ndarray::Array2<f64>, dimensions: usize) -> ndarray::Array2<f64> {
-    if data.ncols() <= dimensions {
-        return data.clone();
-    }
-    
-    let rows = data.nrows();
-    let mut result = ndarray::Array2::<f64>::zeros((rows, dimensions));
-    
-    for i in 0..rows {
-        for j in 0..dimensions {
-            result[[i, j]] = data[[i, j]];
-        }
-    }
-    
-    result
 }
 
 // Fixed function

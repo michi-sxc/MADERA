@@ -172,11 +172,11 @@ impl EMClusterer {
         }
 
         // Keep only clusters above min_cluster_size
+        let init_min_size = std::cmp::max(3, min_cluster_size / 10);
         let valid_clusters: Vec<isize> = cluster_sizes.iter()
-            .filter(|(_, &size)| size >= min_cluster_size)
+            .filter(|(_, &size)| size >= init_min_size)
             .map(|(&id, _)| id)
             .collect();
-
         if valid_clusters.is_empty() {
             warn!("No clusters above min_cluster_size {}. Using all non-noise clusters.", min_cluster_size);
         }
@@ -494,13 +494,183 @@ impl EMClusterer {
             .collect();
     }
 
-    // TODO(v0.5.0): Implement cluster splitting for bimodal detection.
-    // After convergence, check each cluster for bimodality by computing the variance
-    // of multinomial log-likelihoods within the cluster. If variance is significantly
-    // higher than expected (estimable from the multinomial model), split the cluster
-    // into two via k-means on the k=4 count vectors, then continue EM.
-    // This is the split-merge EM variant (Ueda et al. 2000) and is the main thing
-    // limiting clustering resolution when DBSCAN merges two organisms into one cluster.
+    /// Split clusters that contain heterogeneous organisms.
+    ///
+    /// Detection: If a cluster's GC std dev > 0.03, it may contain organisms
+    /// with different GC content (e.g., M. tuberculosis at 66% mixed with
+    /// E. coli at 51%). For such candidates, run 2-means on their k-mer
+    /// count vectors and validate the split via JSD.
+    ///
+    /// Only splits if the two sub-clusters have JSD > merge_threshold,
+    /// ensuring consistency: "different enough to not merge" = "different
+    /// enough to split."
+    fn split_heterogeneous_clusters(
+        &mut self,
+        read_kmer_counts: &[Vec<u16>],
+        gc_values: &[f64],
+        merge_threshold: f64,
+    ) {
+        let gc_std_threshold = 0.03;
+        let min_split_size = 20; // Don't split tiny clusters
+
+        // Collect candidates
+        let n_clusters = self.profiles.len();
+        let mut splits_to_apply: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
+
+        for c in 0..n_clusters {
+            // Gather reads in this cluster
+            let read_indices: Vec<usize> = self.assignments.iter()
+                .enumerate()
+                .filter(|(_, &a)| a == c)
+                .map(|(i, _)| i)
+                .collect();
+
+            if read_indices.len() < min_split_size * 2 {
+                continue; // Too small to split meaningfully
+            }
+
+            // Fast screen: GC standard deviation
+            let gc_mean = read_indices.iter()
+                .map(|&i| gc_values[i])
+                .sum::<f64>() / read_indices.len() as f64;
+            let gc_var = read_indices.iter()
+                .map(|&i| (gc_values[i] - gc_mean).powi(2))
+                .sum::<f64>() / read_indices.len() as f64;
+            let gc_std = gc_var.sqrt();
+
+            if gc_std <= gc_std_threshold {
+                continue; // Homogeneous cluster
+            }
+
+            // Candidate! Run 2-means on k-mer counts
+            let subset_counts: Vec<Vec<u16>> = read_indices.iter()
+                .map(|&i| read_kmer_counts[i].clone())
+                .collect();
+
+            let sub_assignments = two_means_split(&subset_counts, 20);
+
+            // Separate into two groups
+            let group0: Vec<usize> = sub_assignments.iter().enumerate()
+                .filter(|(_, &a)| a == 0)
+                .map(|(i, _)| read_indices[i])
+                .collect();
+            let group1: Vec<usize> = sub_assignments.iter().enumerate()
+                .filter(|(_, &a)| a == 1)
+                .map(|(i, _)| read_indices[i])
+                .collect();
+
+            // Both groups must be large enough
+            if group0.len() < min_split_size || group1.len() < min_split_size {
+                continue;
+            }
+
+            // Build profiles for each sub-cluster and check JSD
+            let profile0 = self.build_profile_for_subset(
+                &group0, read_kmer_counts, gc_values,
+            );
+            let profile1 = self.build_profile_for_subset(
+                &group1, read_kmer_counts, gc_values,
+            );
+
+            let jsd = jensen_shannon_divergence(&profile0.kmer_probs, &profile1.kmer_probs);
+
+            if jsd > merge_threshold {
+                info!("EM split: Cluster {} (n={}, GC_std={:.4}) splitting into {} + {} reads (JSD={:.4})",
+                      c, read_indices.len(), gc_std, group0.len(), group1.len(), jsd);
+                splits_to_apply.push((c, group0, group1));
+            }
+        }
+
+        if splits_to_apply.is_empty() {
+            return;
+        }
+
+        // Apply splits: keep original cluster for group0, create new cluster for group1
+        for (_original_cluster, _group0, group1) in &splits_to_apply {
+            let new_cluster_idx = self.profiles.len();
+
+            // Reassign group1 reads to the new cluster
+            for &read_idx in group1 {
+                self.assignments[read_idx] = new_cluster_idx;
+            }
+
+            // Add a placeholder profile (will be rebuilt)
+            self.profiles.push(ClusterProfile {
+                cluster_id: new_cluster_idx,
+                kmer_probs: vec![1.0 / self.num_kmers as f64; self.num_kmers],
+                log_probs: vec![(1.0 / self.num_kmers as f64).ln(); self.num_kmers],
+                read_count: group1.len(),
+                gc_mean: 0.0,
+            });
+        }
+
+        // Rebuild all profiles from updated assignments
+        let n_new_clusters = self.profiles.len();
+        self.profiles = (0..n_new_clusters)
+            .map(|c| {
+                Self::build_profile_from_reads(
+                    c, read_kmer_counts, gc_values, &self.assignments,
+                    c, self.num_kmers, self.pseudocount,
+                )
+            })
+            .filter(|p| p.read_count > 0)
+            .collect();
+
+        // Remap assignments to contiguous indices
+        let id_map: std::collections::HashMap<usize, usize> = self.profiles.iter()
+            .enumerate()
+            .map(|(new_idx, p)| (p.cluster_id, new_idx))
+            .collect();
+
+        for a in self.assignments.iter_mut() {
+            if let Some(&new_idx) = id_map.get(a) {
+                *a = new_idx;
+            }
+        }
+
+        // Fix cluster_ids to be contiguous
+        for (i, p) in self.profiles.iter_mut().enumerate() {
+            p.cluster_id = i;
+        }
+
+        info!("EM: Applied {} splits, now {} clusters", splits_to_apply.len(), self.profiles.len());
+    }
+
+    /// Build a ClusterProfile from a subset of read indices.
+    fn build_profile_for_subset(
+        &self,
+        read_indices: &[usize],
+        read_kmer_counts: &[Vec<u16>],
+        gc_values: &[f64],
+    ) -> ClusterProfile {
+        let mut aggregated = vec![0u64; self.num_kmers];
+        let mut gc_sum = 0.0f64;
+
+        for &i in read_indices {
+            for (j, &c) in read_kmer_counts[i].iter().enumerate() {
+                aggregated[j] += c as u64;
+            }
+            gc_sum += gc_values[i];
+        }
+
+        let total: u64 = aggregated.iter().sum();
+        let denom = total as f64 + self.pseudocount * self.num_kmers as f64;
+
+        let kmer_probs: Vec<f64> = aggregated.iter()
+            .map(|&v| (v as f64 + self.pseudocount) / denom)
+            .collect();
+        let log_probs: Vec<f64> = kmer_probs.iter()
+            .map(|&p| p.ln())
+            .collect();
+
+        ClusterProfile {
+            cluster_id: 0, // Will be set by caller
+            kmer_probs,
+            log_probs,
+            read_count: read_indices.len(),
+            gc_mean: if read_indices.is_empty() { 0.0 } else { gc_sum / read_indices.len() as f64 },
+        }
+    }
 
     /// Union-find: follow parent chain to root.
     fn find_root(parents: &[usize], mut node: usize) -> usize {
@@ -565,6 +735,7 @@ impl EMClusterer {
             // merging too early when profiles are noisy can permanently collapse distinct clusters)
             if iteration >= 3 {
                 self.merge_similar_clusters(read_kmer_counts, gc_values, merge_threshold);
+                self.split_heterogeneous_clusters(read_kmer_counts, gc_values, merge_threshold);
             }
 
             // Compute total log-likelihood
@@ -607,6 +778,81 @@ impl EMClusterer {
         // Convert to isize for compatibility with existing pipeline
         self.assignments.iter().map(|&a| a as isize).collect()
     }
+}
+
+/// Run 2-means (K-means with k=2) on a subset of k-mer count vectors.
+///
+/// Uses K-means++ initialization: first centroid chosen as read 0,
+/// second chosen as the farthest point from the first.
+/// Returns assignments: 0 or 1 for each read.
+pub fn two_means_split(kmer_counts: &[Vec<u16>], max_iter: usize) -> Vec<usize> {
+    let n = kmer_counts.len();
+    if n < 2 {
+        return vec![0; n];
+    }
+
+    let dim = kmer_counts[0].len();
+
+    // K-means++ initialization
+    // Centroid 0: first read's counts (converted to f64)
+    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(2);
+    centroids.push(kmer_counts[0].iter().map(|&c| c as f64).collect());
+
+    // Centroid 1: farthest point from centroid 0 (deterministic K-means++ variant)
+    let mut max_dist = 0.0f64;
+    let mut farthest_idx = 1;
+    for i in 1..n {
+        let dist: f64 = kmer_counts[i].iter().zip(centroids[0].iter())
+            .map(|(&a, &b)| (a as f64 - b).powi(2))
+            .sum();
+        if dist > max_dist {
+            max_dist = dist;
+            farthest_idx = i;
+        }
+    }
+    centroids.push(kmer_counts[farthest_idx].iter().map(|&c| c as f64).collect());
+
+    // K-means iterations
+    let mut assignments = vec![0usize; n];
+
+    for _iter in 0..max_iter {
+        // Assign each point to nearest centroid
+        let new_assignments: Vec<usize> = (0..n)
+            .map(|i| {
+                let d0: f64 = kmer_counts[i].iter().zip(centroids[0].iter())
+                    .map(|(&a, &b)| (a as f64 - b).powi(2))
+                    .sum();
+                let d1: f64 = kmer_counts[i].iter().zip(centroids[1].iter())
+                    .map(|(&a, &b)| (a as f64 - b).powi(2))
+                    .sum();
+                if d0 <= d1 { 0 } else { 1 }
+            })
+            .collect();
+
+        if new_assignments == assignments {
+            break;
+        }
+        assignments = new_assignments;
+
+        // Recompute centroids
+        for c in 0..2 {
+            let mut sum = vec![0.0f64; dim];
+            let mut count = 0usize;
+            for i in 0..n {
+                if assignments[i] == c {
+                    for j in 0..dim {
+                        sum[j] += kmer_counts[i][j] as f64;
+                    }
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                centroids[c] = sum.iter().map(|&s| s / count as f64).collect();
+            }
+        }
+    }
+
+    assignments
 }
 
 #[cfg(test)]
@@ -671,5 +917,57 @@ mod tests {
         let jsd_pq = jensen_shannon_divergence(&p, &q);
         let jsd_qp = jensen_shannon_divergence(&q, &p);
         assert!((jsd_pq - jsd_qp).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gc_variance_detects_mixed_cluster() {
+        // Simulate a cluster mixing M. tuberculosis (GC=0.66) with E. coli (GC=0.51)
+        let gc_values: Vec<f64> = (0..100).map(|i| {
+            if i < 50 { 0.66 } else { 0.51 }
+        }).collect();
+        let mean: f64 = gc_values.iter().sum::<f64>() / gc_values.len() as f64;
+        let variance = gc_values.iter().map(|&gc| (gc - mean).powi(2)).sum::<f64>() / gc_values.len() as f64;
+        let std_dev = variance.sqrt();
+        // std_dev should be ~0.075, well above the 0.03 threshold
+        assert!(std_dev > 0.03, "GC std_dev {} should exceed 0.03 split threshold", std_dev);
+    }
+
+    #[test]
+    fn test_gc_variance_homogeneous_cluster() {
+        // Simulate a pure E. coli cluster (GC ≈ 0.51 with natural variation)
+        let gc_values: Vec<f64> = (0..100).map(|i| {
+            0.51 + (i as f64 * 0.0001) - 0.005 // tiny variation around 0.51
+        }).collect();
+        let mean: f64 = gc_values.iter().sum::<f64>() / gc_values.len() as f64;
+        let variance = gc_values.iter().map(|&gc| (gc - mean).powi(2)).sum::<f64>() / gc_values.len() as f64;
+        let std_dev = variance.sqrt();
+        // std_dev should be << 0.03
+        assert!(std_dev < 0.03, "GC std_dev {} should be below 0.03 split threshold", std_dev);
+    }
+
+    #[test]
+    fn test_two_means_split_separates_distinct_profiles() {
+        // Create two clearly different k-mer profiles
+        let mut counts_a = vec![0u16; 16]; // k=2, 16 k-mers
+        counts_a[0] = 20; counts_a[1] = 15; counts_a[2] = 10; counts_a[3] = 5;
+        let mut counts_b = vec![0u16; 16];
+        counts_b[12] = 20; counts_b[13] = 15; counts_b[14] = 10; counts_b[15] = 5;
+
+        // Mix into one cluster
+        let all_counts: Vec<Vec<u16>> = (0..20).map(|i| {
+            if i < 10 { counts_a.clone() } else { counts_b.clone() }
+        }).collect();
+
+        // Run 2-means
+        let assignments = two_means_split(&all_counts, 20);
+
+        // First 10 should be in one cluster, last 10 in another
+        let cluster_0 = assignments[0];
+        for i in 1..10 {
+            assert_eq!(assignments[i], cluster_0, "Read {} should be same cluster as read 0", i);
+        }
+        for i in 10..20 {
+            assert_ne!(assignments[i], cluster_0, "Read {} should be different cluster from read 0", i);
+        }
     }
 }
