@@ -4,10 +4,10 @@
 //! optional codon usage, GC content, and damage scores), incremental PCA with progress updates,
 //! and clustering using DBSCAN with spatial indexing (via a kd-tree) and parallel neighbor precomputation.
 //! 
-//! Michael Schneider 2025
+//! Michael Schneider 2026
 //! https://github.com/michi-sxc/MADERA
 //! 
-//! v0.3.1
+//! v0.4.0
 
 use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use env_logger;
@@ -27,8 +27,10 @@ use std::fs::File;
 use zip::{ZipWriter, write::FileOptions};
 
 
-// Module declaration for BAM utilities
+// Module declarations
 mod bam_utils;
+mod em_clustering;
+mod assembly;
 use bam_utils::*;
 
 lazy_static! {
@@ -123,9 +125,39 @@ struct Args {
     #[arg(long, default_value = "exported_clusters.zip")]
     export_output: String,
     
-    /// Include cluster metadata in exported files 
+    /// Include cluster metadata in exported files
     #[arg(long, default_value_t = false)]
     export_with_metadata: bool,
+
+    // === EM Clustering (v0.4.0) ===
+
+    /// Maximum EM iterations for iterative clustering (default: 20)
+    #[arg(long, default_value_t = 20)]
+    em_iterations: usize,
+
+    /// Log-likelihood convergence threshold for EM (default: 0.001)
+    #[arg(long, default_value_t = 0.001)]
+    em_convergence: f64,
+
+    /// Minimum cluster size to retain during EM (default: 10)
+    #[arg(long, default_value_t = 10)]
+    min_cluster_size: usize,
+
+    /// Jensen-Shannon divergence threshold for merging similar clusters (default: 0.01)
+    #[arg(long, default_value_t = 0.01)]
+    merge_threshold: f64,
+
+    /// Enable MEGAHIT assembly pre-step for improved clustering
+    #[arg(long, default_value_t = false)]
+    assemble: bool,
+
+    /// Path to megahit binary (default: "megahit")
+    #[arg(long, default_value = "megahit")]
+    megahit_path: String,
+
+    /// Use legacy v0.3.1 DBSCAN pipeline instead of EM clustering
+    #[arg(long, default_value_t = false)]
+    legacy: bool,
 }
 
 #[derive(Serialize, Clone)]
@@ -176,9 +208,9 @@ struct ClusterSummary {
 // Required structs for processing
 #[derive(Clone, Debug)]
 pub struct Read {
-    id: String,
-    seq: String,
-    quality: Option<Vec<u8>>,
+    pub id: String,
+    pub seq: String,
+    pub quality: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -778,7 +810,7 @@ fn compute_gc_content(seq: &str) -> f64 {
 /// intermediate ChangePointResults and DecayModelResults (when available from the
 /// accurate path). This eliminates duplicate computation — the pipeline can extract
 /// intermediate results directly instead of recomputing them.
-pub fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageAssessmentResult> {
+fn optimized_damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageAssessmentResult> {
     use rayon::prelude::*;
     use std::sync::Mutex;
     use indicatif::{ProgressBar, ProgressStyle};
@@ -2838,6 +2870,152 @@ fn compute_codon_usage(seq: &str) -> HashMap<String, f64> {
     codon_counts
 }
 
+// ============================================================================
+// EM Pipeline Helper Functions (v0.4.0)
+// ============================================================================
+
+/// Build the 18-dimensional initial feature matrix for Phase 1 coarse clustering.
+///
+/// Features per read: [GC, 16 dinucleotide frequencies, normalized_read_length]
+///
+/// - GC content: 1 feature (essentially zero noise, strong biological signal)
+/// - Dinucleotide frequencies (k=2): 16 features (SNR ≈ 2.0 on 60bp reads)
+/// - Normalized read length: log2(len) / 12.0 (puts 30-4096bp in 0.4-1.0 range)
+///
+/// These features are statistically reliable on individual short reads, unlike
+/// k=4 tetranucleotide frequencies which have SNR ≈ 0.5 on 60bp reads.
+fn build_initial_feature_matrix(
+    reads: &[Read],
+    gc_scores: &HashMap<String, f64>,
+) -> ndarray::Array2<f64> {
+    use ndarray::Array2;
+
+    // 16 dinucleotides + GC + read_length = 18 features
+    let dinuc_list = get_all_kmers(2); // 16 dinucleotides: AA, AC, AG, AT, CA, ...
+    let n_features = 18;
+    let n_reads = reads.len();
+
+    let mut matrix = Array2::<f64>::zeros((n_reads, n_features));
+
+    // Build feature vectors in parallel, collect into matrix
+    let feature_rows: Vec<Vec<f64>> = reads.par_iter()
+        .map(|read| {
+            let mut features = Vec::with_capacity(n_features);
+
+            // Feature 0: GC content
+            let gc = gc_scores.get(&read.id)
+                .copied()
+                .unwrap_or_else(|| compute_gc_content(&read.seq));
+            features.push(gc);
+
+            // Features 1-16: Dinucleotide frequencies
+            let dinuc_freq = compute_kmer_freq(&read.seq, 2, &dinuc_list);
+            for dinuc in &dinuc_list {
+                features.push(*dinuc_freq.get(dinuc).unwrap_or(&0.0));
+            }
+
+            // Feature 17: Normalized read length
+            // log2(len) / 12.0 puts typical aDNA reads (30-4096bp) in 0.4-1.0 range
+            let norm_len = if read.seq.len() > 0 {
+                (read.seq.len() as f64).log2() / 12.0
+            } else {
+                0.0
+            };
+            features.push(norm_len);
+
+            features
+        })
+        .collect();
+
+    for (i, row) in feature_rows.iter().enumerate() {
+        for (j, &val) in row.iter().enumerate() {
+            matrix[[i, j]] = val;
+        }
+    }
+
+    matrix
+}
+
+/// Precompute raw k-mer count vectors for all reads in parallel.
+///
+/// Uses the fast index-based counting from `em_clustering::compute_kmer_counts`
+/// instead of the HashMap-based `compute_kmer_freq`. For k=4, this returns
+/// Vec<u16> of length 256 per read.
+///
+/// Memory: 100K reads × 256 × 2 bytes = ~50 MB (u16)
+fn precompute_kmer_counts(reads: &[Read], k: usize) -> Vec<Vec<u16>> {
+    let num_kmers = 4usize.pow(k as u32);
+
+    reads.par_iter()
+        .map(|read| {
+            em_clustering::compute_kmer_counts(read.seq.as_bytes(), k, num_kmers)
+        })
+        .collect()
+}
+
+/// Perform coarse initial clustering on the 18-dim robust feature matrix.
+///
+/// Uses existing DBSCAN infrastructure with auto-epsilon. This is Phase 1
+/// of the EM pipeline — the clusters don't need to be perfect, just good
+/// enough to bootstrap the EM iterations.
+///
+/// For 18 dimensions, the spatial index uses a KD-tree (the grid-based index
+/// is infeasible at D=18 due to O(3^18) neighbor cell enumeration).
+fn coarse_initial_clustering(
+    features: &ndarray::Array2<f64>,
+    min_samples: usize,
+    eps: f64,
+    auto_epsilon: bool,
+) -> Vec<isize> {
+    let n_dims = features.ncols();
+    info!("Phase 1: Coarse clustering on {}-dim robust features ({} reads)",
+          n_dims, features.nrows());
+
+    // Determine epsilon
+    let effective_eps = if auto_epsilon {
+        info!("Computing auto-epsilon for {}-dim initial features...", n_dims);
+        let k_distances = match n_dims {
+            2 => compute_k_distance_for_dim::<2>(features, min_samples),
+            3 => compute_k_distance_for_dim::<3>(features, min_samples),
+            4 => compute_k_distance_for_dim::<4>(features, min_samples),
+            5 => compute_k_distance_for_dim::<5>(features, min_samples),
+            18 => compute_k_distance_for_dim::<18>(features, min_samples),
+            _ => {
+                warn!("K-distance not implemented for {} dims, truncating to 5", n_dims);
+                let truncated = truncate_pca_dimensions(features, 5);
+                compute_k_distance_for_dim::<5>(&truncated, min_samples)
+            }
+        };
+        let optimal = find_optimal_eps(&k_distances);
+        info!("Auto-epsilon for initial clustering: {:.4}", optimal);
+        optimal
+    } else {
+        eps
+    };
+
+    // Run DBSCAN
+    let clusters = match n_dims {
+        2 => optimized_dbscan::<2>(features, effective_eps, min_samples),
+        3 => optimized_dbscan::<3>(features, effective_eps, min_samples),
+        4 => optimized_dbscan::<4>(features, effective_eps, min_samples),
+        5 => optimized_dbscan::<5>(features, effective_eps, min_samples),
+        18 => optimized_dbscan::<18>(features, effective_eps, min_samples),
+        _ => {
+            warn!("DBSCAN not supported for {} dims, truncating to 5", n_dims);
+            let truncated = truncate_pca_dimensions(features, 5);
+            optimized_dbscan::<5>(&truncated, effective_eps, min_samples)
+        }
+    };
+
+    let unique: HashSet<isize> = clusters.iter().cloned().collect();
+    let noise = clusters.iter().filter(|&&c| c == -1).count();
+    let n_clusters = unique.len() - if noise > 0 { 1 } else { 0 };
+    info!("Phase 1 result: {} coarse clusters, {} noise points ({:.1}%)",
+          n_clusters, noise, 100.0 * noise as f64 / clusters.len() as f64);
+
+    clusters
+}
+
 /// Incremental PCA implementation
 fn incremental_pca(
     reads: &[Read],
@@ -2938,8 +3116,8 @@ fn incremental_pca(
     // Incremental PCA with proper covariance update (Ross et al. 2008)
     let mut mean = Array1::<f64>::zeros(total_features);
     let mut cov = Array2::<f64>::zeros((total_features, total_features));
-    let mut components: Array2<f64>;
-    let mut explained_variance: Vec<f64>;
+    let components: Array2<f64>;
+    let explained_variance: Vec<f64>;
     let mut n_samples_seen: usize = 0;
 
     for batch_start in (0..n_samples).step_by(batch_size) {
@@ -3209,18 +3387,28 @@ fn optimized_dbscan<const D: usize>(
     labels
 }
 
-/// Build optimized spatial index based on data dimensionality and size
+/// Build optimized spatial index based on data dimensionality and size.
+///
+/// Strategy selection:
+/// - D > 10: Always use KD-tree. Grid-based index enumerates 3^D neighbor
+///   cells which is infeasible for high dimensions (3^18 = 387M cells).
+///   KD-trees degrade in high dims but remain functional.
+/// - D <= 10, small dataset: Grid index (low overhead, exact).
+/// - D <= 10, large dataset: KD-tree (O(n log n) construction, fast queries).
 fn build_optimized_spatial_index<const D: usize>(
-    points: &[(usize, [f64; D])], 
+    points: &[(usize, [f64; D])],
     eps_sq: f64
 ) -> SpatialIndex<D> {
-    // For small datasets or high dimensions, use a simple index
-    if points.len() < 10000 || D > 5 {
-        return build_grid_index(points, eps_sq.sqrt());
-    } else {
-        // For larger datasets in lower dimensions, use a tree-based index
+    // Grid neighbor enumeration is O(3^D) — infeasible for D > 10
+    if D > 10 {
         return build_tree_index(points);
     }
+    // For small datasets in low dims, grid is simpler
+    if points.len() < 10000 || D > 5 {
+        return build_grid_index(points, eps_sq.sqrt());
+    }
+    // Large datasets in low dims: KD-tree
+    build_tree_index(points)
 }
 
 /// Build a grid-based spatial index for high-dimensional data
@@ -4758,6 +4946,7 @@ impl_dbscan_for_dim!(7);
 impl_dbscan_for_dim!(8);
 impl_dbscan_for_dim!(9);
 impl_dbscan_for_dim!(10);
+impl_dbscan_for_dim!(18);
 impl_dbscan_for_dim!(20);
 
 
@@ -4774,6 +4963,7 @@ pub fn dynamic_dbscan_clustering(data: &ndarray::Array2<f64>, eps: f64, min_samp
         8 => <[(); 8]>::dbscan_clustering(data, eps, min_samples),
         9 => <[(); 9]>::dbscan_clustering(data, eps, min_samples),
         10 => <[(); 10]>::dbscan_clustering(data, eps, min_samples),
+        18 => <[(); 18]>::dbscan_clustering(data, eps, min_samples),
         20 => <[(); 20]>::dbscan_clustering(data, eps, min_samples),
         _ => panic!("Unsupported dimension: {}. Add implementation for this dimension.", data.ncols()),
     }
@@ -4895,6 +5085,7 @@ pub fn compute_k_distance_data(data: &ndarray::Array2<f64>, k: usize) -> Vec<f64
         8 => compute_k_distance_for_dim::<8>(data, k),
         9 => compute_k_distance_for_dim::<9>(data, k),
         10 => compute_k_distance_for_dim::<10>(data, k),
+        18 => compute_k_distance_for_dim::<18>(data, k),
         20 => compute_k_distance_for_dim::<20>(data, k),
         _ => panic!("Unsupported dimension: {}. Add implementation for this dimension.", data.ncols()),
     }
@@ -4988,10 +5179,17 @@ fn main() {
         export_format: matches.get_one::<String>("export_format").unwrap_or(&String::from("same")).clone(),
         export_output: matches.get_one::<String>("export_output").unwrap_or(&String::from("exported_clusters.zip")).clone(),
         export_with_metadata: matches.get_flag("export_with_metadata"),
+        em_iterations: matches.get_one::<String>("em_iterations").unwrap_or(&String::from("20")).parse().unwrap_or(20),
+        em_convergence: matches.get_one::<String>("em_convergence").unwrap_or(&String::from("0.001")).parse().unwrap_or(0.001),
+        min_cluster_size: matches.get_one::<String>("min_cluster_size").unwrap_or(&String::from("10")).parse().unwrap_or(10),
+        merge_threshold: matches.get_one::<String>("merge_threshold").unwrap_or(&String::from("0.01")).parse().unwrap_or(0.01),
+        assemble: matches.get_flag("assemble"),
+        megahit_path: matches.get_one::<String>("megahit_path").unwrap_or(&String::from("megahit")).clone(),
+        legacy: matches.get_flag("legacy"),
     };
 
-    info!("Starting MADERA Pipeline v0.3.1");
-    
+    info!("Starting MADERA Pipeline v0.4.0");
+
     // Validate parameters
     if args.pca_components > 20 {
         error!("PCA components exceeding 20 are not supported by this implementation");
@@ -5036,10 +5234,10 @@ fn display_banner() {
              
                                         
 Metagenomic Ancient DNA Evaluation and Reference-free Analysis
-version 0.3.1
+version 0.4.0
 "#);
     println!("An advanced pipeline for ancient DNA quality control, damage pattern analysis,");
-    println!("clustering, and taxonomic assignment without requiring reference genomes.");
+    println!("and EM-based iterative clustering without requiring reference genomes.");
     println!();
     println!("Supports both FASTQ and BAM input formats.");
     println!();
@@ -5055,10 +5253,10 @@ version 0.3.1
 /// Setup the help menu and command line arguments
 fn setup_cli() -> Command {
     Command::new("MADERA")
-        .version("0.3.1")
+        .version("0.4.0")
         .about(format!("{}\n{}",
             "MADERA Pipeline: Metagenomic Ancient DNA Evaluation and Reference-free Analysis".bright_green().bold(),
-            "An advanced tool for ancient DNA quality control and clustering analysis".cyan()
+            "An advanced tool for ancient DNA quality control and EM-based iterative clustering".cyan()
         ))
         .author("Michael Schneider <michi.schneider123@outlook.de>")
         .arg(
@@ -5280,7 +5478,71 @@ fn setup_cli() -> Command {
                 .long("export-with-metadata")
                 .help(format!("{}: Include cluster metadata in exported files", "Cluster Export".bright_blue().bold()))
                 .action(clap::ArgAction::SetTrue)
-        )        
+        )
+        // EM Clustering options (v0.4.0)
+        .group(
+            ArgGroup::new("em_clustering")
+                .arg("em_iterations")
+                .arg("em_convergence")
+                .arg("min_cluster_size")
+                .arg("merge_threshold")
+                .arg("assemble")
+                .arg("megahit_path")
+                .arg("legacy")
+                .multiple(true)
+        )
+        .arg(
+            Arg::new("em_iterations")
+                .long("em-iterations")
+                .help(format!("{}: Maximum EM iterations for iterative clustering", "EM Clustering".bright_blue().bold()))
+                .default_value("20")
+                .num_args(1)
+                .value_name("INT")
+        )
+        .arg(
+            Arg::new("em_convergence")
+                .long("em-convergence")
+                .help(format!("{}: Log-likelihood convergence threshold for EM", "EM Clustering".bright_blue().bold()))
+                .default_value("0.001")
+                .num_args(1)
+                .value_name("FLOAT")
+        )
+        .arg(
+            Arg::new("min_cluster_size")
+                .long("min-cluster-size")
+                .help(format!("{}: Minimum cluster size to retain during EM", "EM Clustering".bright_blue().bold()))
+                .default_value("10")
+                .num_args(1)
+                .value_name("INT")
+        )
+        .arg(
+            Arg::new("merge_threshold")
+                .long("merge-threshold")
+                .help(format!("{}: Jensen-Shannon divergence threshold for merging similar clusters", "EM Clustering".bright_blue().bold()))
+                .default_value("0.01")
+                .num_args(1)
+                .value_name("FLOAT")
+        )
+        .arg(
+            Arg::new("assemble")
+                .long("assemble")
+                .help(format!("{}: Enable MEGAHIT assembly pre-step for improved clustering", "EM Clustering".bright_blue().bold()))
+                .action(clap::ArgAction::SetTrue)
+        )
+        .arg(
+            Arg::new("megahit_path")
+                .long("megahit-path")
+                .help(format!("{}: Path to megahit binary", "EM Clustering".bright_blue().bold()))
+                .default_value("megahit")
+                .num_args(1)
+                .value_name("PATH")
+        )
+        .arg(
+            Arg::new("legacy")
+                .long("legacy")
+                .help(format!("{}: Use legacy v0.3.1 DBSCAN pipeline instead of EM clustering", "EM Clustering".bright_blue().bold()))
+                .action(clap::ArgAction::SetTrue)
+        )
         // Add examples section
         .after_help(format!("{}:\n  {} --fastq samples.fastq --min_length 50 --k 3 --auto_epsilon\n  {} --fastq samples.fastq --dashboard --batch_size 5000 --pca_components 3\n  {} --bam samples.bam --bam-filter unmapped --min_length 35\n  {} --bam samples.bam --bam-filter mapped --damage_threshold 0.7\n  {} --fastq samples.fastq --export-clusters --export-min-size 50 --export-format fasta\n  {} --bam samples.bam --export-clusters --export-min-size 100 --export-output clusters.zip",
             "Examples".underline().cyan(),
@@ -5324,8 +5586,9 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                           detected_type, expected_type).into());
     }
     
-    info!("Starting MADERA Pipeline v0.3.1");
+    info!("Starting MADERA Pipeline v0.4.0");
     info!("Input file: {} ({})", file_path, detected_type);
+    info!("Pipeline mode: {}", if args.legacy { "Legacy DBSCAN (v0.3.1)" } else { "EM Iterative Clustering (v0.4.0)" });
     
     // Quality control
     info!("Performing quality control (min length: {})...", args.min_length);
@@ -5399,181 +5662,70 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         .map(|(id, result)| (id.clone(), result.score.clone()))
         .collect();
 
-    // Precompute feature lists
-    let kmers_list = get_all_kmers(args.k);
-    info!("Using {}-mer frequency analysis ({} features)", args.k, kmers_list.len());
-    
-    let codon_list = if args.use_codon { 
-        info!("Including codon usage analysis (64 features)");
-        Some(get_all_kmers(3)) 
-    } else { 
-        None 
-    };
-    
-    // Calculate total features dimension for PCA
-    // Count all the features we're actually adding in the feature_extractor:
-    // 1. k-mer frequencies: kmers_list.len()
-    // 2. Optional codon usage: codon_list.as_ref().map_or(0, |v| v.len())
-    // 3. GC content: 1 feature
-    // 4. Damage scores (damage5, damage3, combined): 3 features
-    // 5. Change point confidence: 1 feature
-    // 6. Model fit quality (prime5_model_fit, prime3_model_fit): 2 features
-    // 7. Damage ratio: 1 feature 
-    // 8. Position-specific decay rate features (prime5_lambda, prime3_lambda): 2 features
-    // 9. Read pair support: 1 feature
-    // 10. Log-likelihood ratio: 1 feature
-    // Total: kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12
-    
-    // Note: codon usage on random reading frames is unreliable for aDNA reads
-    // (reads start at arbitrary genome positions, so reading frame is unknown).
-    // The feature is kept for compatibility but disabled by default (--use_codon flag).
-    let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12;
-    info!("Total feature space dimension: {}", total_features);
+    // =========================================================================
+    // Pipeline branching: EM (default) vs Legacy DBSCAN
+    // =========================================================================
 
-    // Extract intermediate results from the damage assessment.
-    // For reads that went through the accurate path (< 100 bp), the ChangePointResults
-    // and DecayModelResults are already computed. For reads that went through the fast
-    // path (>= 100 bp), we compute them now (only for those reads).
-    // This eliminates the duplicate computation that previously existed.
-    info!("Extracting/computing damage model features...");
-    let precomputed_cp: HashMap<String, ChangePointResults> = reads.iter()
-        .map(|read| {
-            // Try to reuse intermediate results from the accurate damage assessment path
-            let cp = if let Some(assessment) = damage_scores.get(&read.id) {
-                if let Some(ref cp_result) = assessment.change_point {
-                    cp_result.clone()
+    if args.legacy {
+        // =====================================================================
+        // LEGACY PIPELINE (v0.3.1): PCA → DBSCAN
+        // =====================================================================
+        info!("Running legacy v0.3.1 pipeline (--legacy flag)");
+
+        // Precompute feature lists
+        let kmers_list = get_all_kmers(args.k);
+        info!("Using {}-mer frequency analysis ({} features)", args.k, kmers_list.len());
+
+        let codon_list = if args.use_codon {
+            info!("Including codon usage analysis (64 features)");
+            Some(get_all_kmers(3))
+        } else {
+            None
+        };
+
+        let total_features = kmers_list.len() + codon_list.as_ref().map_or(0, |v| v.len()) + 12;
+        info!("Total feature space dimension: {}", total_features);
+
+        // Extract intermediate results from damage assessment
+        info!("Extracting/computing damage model features...");
+        let precomputed_cp: HashMap<String, ChangePointResults> = reads.iter()
+            .map(|read| {
+                let cp = if let Some(assessment) = damage_scores.get(&read.id) {
+                    if let Some(ref cp_result) = assessment.change_point {
+                        cp_result.clone()
+                    } else {
+                        detect_damage_change_points(read, args.damage_window)
+                    }
                 } else {
-                    // Fast path reads don't have intermediate results; compute now
                     detect_damage_change_points(read, args.damage_window)
-                }
-            } else {
-                detect_damage_change_points(read, args.damage_window)
-            };
-            (read.id.clone(), cp)
-        })
-        .collect();
+                };
+                (read.id.clone(), cp)
+            })
+            .collect();
 
-    let precomputed_decay: HashMap<String, DecayModelResults> = reads.iter()
-        .map(|read| {
-            // Try to reuse intermediate results from the accurate damage assessment path
-            let decay = if let Some(assessment) = damage_scores.get(&read.id) {
-                if let Some(ref decay_result) = assessment.decay_model {
-                    decay_result.clone()
+        let precomputed_decay: HashMap<String, DecayModelResults> = reads.iter()
+            .map(|read| {
+                let decay = if let Some(assessment) = damage_scores.get(&read.id) {
+                    if let Some(ref decay_result) = assessment.decay_model {
+                        decay_result.clone()
+                    } else {
+                        fit_decay_damage_model(read, args.damage_window)
+                    }
                 } else {
-                    // Fast path reads don't have intermediate results; compute now
                     fit_decay_damage_model(read, args.damage_window)
-                }
-            } else {
-                fit_decay_damage_model(read, args.damage_window)
-            };
-            (read.id.clone(), decay)
-        })
-        .collect();
+                };
+                (read.id.clone(), decay)
+            })
+            .collect();
 
-    // Two-pass approach for read pair overlap analysis:
-    // Pass 1: Add ALL reads to the pair cache first (so both mates are present)
-    // Pass 2: Process all completed pairs
-    // Pass 3: Collect results for all reads
-    // This fixes the order-dependency bug where read1 would get default results
-    // because read2 hadn't been cached yet when read1 was processed.
-    info!("Populating read pair cache...");
-    for read in &reads {
-        GLOBAL_CACHE.add_read(read);
-    }
-    info!("Processing all read pairs...");
-    GLOBAL_CACHE.process_all_pairs();
-    let default_pair_result = ReadPairResults {
-        has_overlap: false,
-        overlap_size: 0,
-        c_to_t_mismatches: 0,
-        g_to_a_mismatches: 0,
-        other_mismatches: 0,
-        pair_support_score: 0.5,
-    };
-    let precomputed_pairs: HashMap<String, ReadPairResults> = reads.iter()
-        .map(|read| {
-            let result = GLOBAL_CACHE.get_overlap_results(&read.id)
-                .unwrap_or(default_pair_result.clone());
-            (read.id.clone(), result)
-        })
-        .collect();
-    info!("Precomputed damage model features for {} reads", precomputed_cp.len());
-
-    // Define feature extractor closure using precomputed results (no recomputation)
-    let feature_extractor = |read: &Read| -> Vec<f64> {
-        let mut features = Vec::with_capacity(total_features);
-
-        // 1. k-mer frequencies
-        let freq = compute_kmer_freq(&read.seq, args.k, &kmers_list);
-        for kmer in &kmers_list {
-            features.push(*freq.get(kmer).unwrap_or(&0.0));
+        // Read pair overlap analysis
+        info!("Populating read pair cache...");
+        for read in &reads {
+            GLOBAL_CACHE.add_read(read);
         }
-
-        // 2. Optional codon usage (disabled by default - unreliable on random reading frames)
-        if let Some(ref codon_list) = codon_list {
-            let usage = compute_codon_usage(&read.seq);
-            for codon in codon_list {
-                features.push(*usage.get(codon).unwrap_or(&0.0));
-            }
-        }
-
-        // 3. GC content (1 feature)
-        if let Some(&gc) = gc_scores.get(&read.id) {
-            features.push(gc);
-        } else {
-            features.push(compute_gc_content(&read.seq));
-        }
-
-        // 4. Damage scores (3 features)
-        if let Some(damage) = damage_score_map.get(&read.id) {
-            features.push(damage.damage5);
-            features.push(damage.damage3);
-            features.push(damage.combined);
-        } else {
-            features.push(0.2);
-            features.push(0.2);
-            features.push(0.2);
-        }
-
-        // 5. Change point confidence (1 feature) - from precomputed results
-        let default_cp = ChangePointResults {
-            prime5_pvalue: 1.0,
-            prime3_pvalue: 1.0,
-            prime5_score: 0.0,
-            prime3_score: 0.0,
-        };
-        let cp_results = precomputed_cp.get(&read.id).unwrap_or(&default_cp);
-        features.push(1.0 - cp_results.prime5_pvalue.min(cp_results.prime3_pvalue));
-
-        // 6. Model fit quality (2 features) - from precomputed results
-        let default_decay = DecayModelResults {
-            prime5_lambda: 0.0,
-            prime3_lambda: 0.0,
-            prime5_model_fit: 0.0,
-            prime3_model_fit: 0.0,
-            log_likelihood_ratio: 0.0,
-        };
-        let decay_results = precomputed_decay.get(&read.id).unwrap_or(&default_decay);
-        features.push(decay_results.prime5_model_fit);
-        features.push(decay_results.prime3_model_fit);
-
-        // 7. Damage ratio (1 feature)
-        let default_damage = DamageScore { damage5: 0.2, damage3: 0.2, combined: 0.2 };
-        let damage = damage_score_map.get(&read.id).unwrap_or(&default_damage);
-
-        let damage_ratio = if damage.damage3 > 0.0 {
-            damage.damage5 / damage.damage3
-        } else {
-            2.0
-        };
-        features.push(damage_ratio.min(3.0).max(0.33));
-
-        // 8. Position-specific decay rate features (2 features) - from precomputed results
-        features.push(decay_results.prime5_lambda);
-        features.push(decay_results.prime3_lambda);
-
-        // 9. Read pair support (1 feature) - from precomputed results
-        let default_pair = ReadPairResults {
+        info!("Processing all read pairs...");
+        GLOBAL_CACHE.process_all_pairs();
+        let default_pair_result = ReadPairResults {
             has_overlap: false,
             overlap_size: 0,
             c_to_t_mismatches: 0,
@@ -5581,194 +5733,401 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             other_mismatches: 0,
             pair_support_score: 0.5,
         };
-        let read_pair_results = precomputed_pairs.get(&read.id).unwrap_or(&default_pair);
-        features.push(read_pair_results.pair_support_score);
+        let precomputed_pairs: HashMap<String, ReadPairResults> = reads.iter()
+            .map(|read| {
+                let result = GLOBAL_CACHE.get_overlap_results(&read.id)
+                    .unwrap_or(default_pair_result.clone());
+                (read.id.clone(), result)
+            })
+            .collect();
+        info!("Precomputed damage model features for {} reads", precomputed_cp.len());
 
-        // 10. Log-likelihood ratio (1 feature) - from precomputed results
-        features.push((decay_results.log_likelihood_ratio.max(-5.0).min(5.0) + 5.0) / 10.0);
+        // Feature extractor closure
+        let feature_extractor = |read: &Read| -> Vec<f64> {
+            let mut features = Vec::with_capacity(total_features);
 
-        // Safety check
-        assert_eq!(features.len(), total_features,
-            "Feature count mismatch for read {}: got {}, expected {}",
-            read.id, features.len(), total_features);
+            let freq = compute_kmer_freq(&read.seq, args.k, &kmers_list);
+            for kmer in &kmers_list {
+                features.push(*freq.get(kmer).unwrap_or(&0.0));
+            }
 
-        features
-    };
-    
-    // Incremental PCA
-    info!("Performing incremental PCA (components: {}, batch size: {})...", 
-          args.pca_components, args.batch_size);
-          
-    let (mean, eigenvectors, eigenvalues, pca_results) =
-        incremental_pca(&reads, args.batch_size, feature_extractor, total_features, args.pca_components);
-    
-    // Check if PCA succeeded
-    if pca_results.nrows() == 0 {
-        return Err("PCA failed: no valid feature vectors could be extracted".into());
-    }
-    
-    let actual_dimensions = pca_results.ncols();
-    info!("PCA yielded {} dimensions (requested: {})", actual_dimensions, args.pca_components);
+            if let Some(ref codon_list) = codon_list {
+                let usage = compute_codon_usage(&read.seq);
+                for codon in codon_list {
+                    features.push(*usage.get(codon).unwrap_or(&0.0));
+                }
+            }
 
-    info!("PCA complete. Explained variance:");
-    let total_variance: f64 = eigenvalues.iter().sum();
-    for (i, &val) in eigenvalues.iter().enumerate() {
-        let explained = (val / total_variance) * 100.0;
-        info!("  PC{}: {:.2}% (eigenvalue: {:.4})", i+1, explained, val);
-    }
-    if actual_dimensions == 0 {
-        return Err("PCA resulted in zero dimensions. Cannot perform clustering.".into());
-    }
-    
-    // Determine how many dimensions to use for clustering
-    let cluster_dimensions = std::cmp::min(actual_dimensions, args.pca_components);
-    
-    // Epsilon selection
-    let eps = if args.auto_epsilon {
-        info!("Calculating optimal epsilon using k-distance method...");
-        // Adapt compute_k_distance_data to handle varying dimensions
-        let k_distances = match cluster_dimensions {
-            1 => compute_k_distance_for_dim::<1>(&pca_results, args.min_samples),
-            2 => compute_k_distance_for_dim::<2>(&pca_results, args.min_samples),
-            3 => compute_k_distance_for_dim::<3>(&pca_results, args.min_samples),
-            4 => compute_k_distance_for_dim::<4>(&pca_results, args.min_samples),
-            5 => compute_k_distance_for_dim::<5>(&pca_results, args.min_samples),
-            _ => {
-                warn!("K-distance calculation not implemented for {} dimensions. Using first 5 dimensions.", actual_dimensions);
-                // Truncate to 5 dimensions for k-distance calculation
-                let truncated = truncate_pca_dimensions(&pca_results, 5);
-                compute_k_distance_for_dim::<5>(&truncated, args.min_samples)
+            if let Some(&gc) = gc_scores.get(&read.id) {
+                features.push(gc);
+            } else {
+                features.push(compute_gc_content(&read.seq));
+            }
+
+            if let Some(damage) = damage_score_map.get(&read.id) {
+                features.push(damage.damage5);
+                features.push(damage.damage3);
+                features.push(damage.combined);
+            } else {
+                features.push(0.2);
+                features.push(0.2);
+                features.push(0.2);
+            }
+
+            let default_cp = ChangePointResults {
+                prime5_pvalue: 1.0, prime3_pvalue: 1.0,
+                prime5_score: 0.0, prime3_score: 0.0,
+            };
+            let cp_results = precomputed_cp.get(&read.id).unwrap_or(&default_cp);
+            features.push(1.0 - cp_results.prime5_pvalue.min(cp_results.prime3_pvalue));
+
+            let default_decay = DecayModelResults {
+                prime5_lambda: 0.0, prime3_lambda: 0.0,
+                prime5_model_fit: 0.0, prime3_model_fit: 0.0,
+                log_likelihood_ratio: 0.0,
+            };
+            let decay_results = precomputed_decay.get(&read.id).unwrap_or(&default_decay);
+            features.push(decay_results.prime5_model_fit);
+            features.push(decay_results.prime3_model_fit);
+
+            let default_damage = DamageScore { damage5: 0.2, damage3: 0.2, combined: 0.2 };
+            let damage = damage_score_map.get(&read.id).unwrap_or(&default_damage);
+            let damage_ratio = if damage.damage3 > 0.0 {
+                damage.damage5 / damage.damage3
+            } else { 2.0 };
+            features.push(damage_ratio.min(3.0).max(0.33));
+
+            features.push(decay_results.prime5_lambda);
+            features.push(decay_results.prime3_lambda);
+
+            let default_pair = ReadPairResults {
+                has_overlap: false, overlap_size: 0,
+                c_to_t_mismatches: 0, g_to_a_mismatches: 0,
+                other_mismatches: 0, pair_support_score: 0.5,
+            };
+            let read_pair_results = precomputed_pairs.get(&read.id).unwrap_or(&default_pair);
+            features.push(read_pair_results.pair_support_score);
+
+            features.push((decay_results.log_likelihood_ratio.max(-5.0).min(5.0) + 5.0) / 10.0);
+
+            assert_eq!(features.len(), total_features,
+                "Feature count mismatch for read {}: got {}, expected {}",
+                read.id, features.len(), total_features);
+            features
+        };
+
+        // Incremental PCA
+        info!("Performing incremental PCA (components: {}, batch size: {})...",
+              args.pca_components, args.batch_size);
+
+        let (mean, eigenvectors, eigenvalues, pca_results) =
+            incremental_pca(&reads, args.batch_size, feature_extractor, total_features, args.pca_components);
+
+        if pca_results.nrows() == 0 {
+            return Err("PCA failed: no valid feature vectors could be extracted".into());
+        }
+
+        let actual_dimensions = pca_results.ncols();
+        info!("PCA yielded {} dimensions (requested: {})", actual_dimensions, args.pca_components);
+
+        info!("PCA complete. Explained variance:");
+        let total_variance: f64 = eigenvalues.iter().sum();
+        for (i, &val) in eigenvalues.iter().enumerate() {
+            let explained = (val / total_variance) * 100.0;
+            info!("  PC{}: {:.2}% (eigenvalue: {:.4})", i+1, explained, val);
+        }
+        if actual_dimensions == 0 {
+            return Err("PCA resulted in zero dimensions. Cannot perform clustering.".into());
+        }
+
+        let cluster_dimensions = std::cmp::min(actual_dimensions, args.pca_components);
+
+        // Epsilon selection
+        let eps = if args.auto_epsilon {
+            info!("Calculating optimal epsilon using k-distance method...");
+            let k_distances = match cluster_dimensions {
+                1 => compute_k_distance_for_dim::<1>(&pca_results, args.min_samples),
+                2 => compute_k_distance_for_dim::<2>(&pca_results, args.min_samples),
+                3 => compute_k_distance_for_dim::<3>(&pca_results, args.min_samples),
+                4 => compute_k_distance_for_dim::<4>(&pca_results, args.min_samples),
+                5 => compute_k_distance_for_dim::<5>(&pca_results, args.min_samples),
+                _ => {
+                    warn!("K-distance not implemented for {} dims. Using first 5.", actual_dimensions);
+                    let truncated = truncate_pca_dimensions(&pca_results, 5);
+                    compute_k_distance_for_dim::<5>(&truncated, args.min_samples)
+                }
+            };
+            let optimal_eps = find_optimal_eps(&k_distances);
+            info!("Automatically determined epsilon: {:.4} (user provided: {:.4})",
+                  optimal_eps, args.eps);
+            optimal_eps
+        } else {
+            info!("Using user-specified epsilon: {:.4}", args.eps);
+            args.eps
+        };
+
+        // DBSCAN clustering
+        info!("Clustering reads with DBSCAN (eps: {:.4}, min_samples: {}, dimensions: {})...",
+              eps, args.min_samples, cluster_dimensions);
+
+        let clusters = if cluster_dimensions == 1 {
+            info!("Using 1D clustering algorithm");
+            cluster_1d(&pca_results, eps, args.min_samples)
+        } else {
+            match cluster_dimensions {
+                2 => optimized_dbscan::<2>(&pca_results, eps, args.min_samples),
+                3 => optimized_dbscan::<3>(&pca_results, eps, args.min_samples),
+                4 => optimized_dbscan::<4>(&pca_results, eps, args.min_samples),
+                5 => optimized_dbscan::<5>(&pca_results, eps, args.min_samples),
+                _ => {
+                    warn!("DBSCAN not supported for {} dims. Using first 5.", cluster_dimensions);
+                    let truncated = truncate_pca_dimensions(&pca_results, 5);
+                    optimized_dbscan::<5>(&truncated, eps, args.min_samples)
+                }
             }
         };
-        
-        // Find the elbow point in the k-distance graph
-        let optimal_eps = find_optimal_eps(&k_distances);
-        info!("Automatically determined epsilon: {:.4} (user provided: {:.4})", 
-              optimal_eps, args.eps);
-        optimal_eps
-    } else {
-        info!("Using user-specified epsilon: {:.4}", args.eps);
-        args.eps
-    };
-    
-    // Clustering with dimension safety checks
-    info!("Clustering reads with DBSCAN (eps: {:.4}, min_samples: {}, dimensions: {})...", 
-          eps, args.min_samples, cluster_dimensions);
-    
-    let clusters = if cluster_dimensions == 1 {
-        // Special case for 1D data
-        info!("Using 1D clustering algorithm");
-        cluster_1d(&pca_results, eps, args.min_samples)
-    } else {
-        // Dynamic dispatch for DBSCAN based on dimensions
-        match cluster_dimensions {
-            2 => optimized_dbscan::<2>(&pca_results, eps, args.min_samples),
-            3 => optimized_dbscan::<3>(&pca_results, eps, args.min_samples),
-            4 => optimized_dbscan::<4>(&pca_results, eps, args.min_samples),
-            5 => optimized_dbscan::<5>(&pca_results, eps, args.min_samples),
-            _ => {
-                warn!("DBSCAN not directly supported for {} dimensions. Using first 5 components.", cluster_dimensions);
-                let truncated = truncate_pca_dimensions(&pca_results, 5);
-                optimized_dbscan::<5>(&truncated, eps, args.min_samples)
+
+        // Cluster statistics
+        let unique_clusters: HashSet<isize> = clusters.iter().cloned().collect();
+        let noise_count = clusters.iter().filter(|&&c| c == -1).count();
+        let cluster_count = unique_clusters.len() - (if noise_count > 0 { 1 } else { 0 });
+        info!("DBSCAN complete. Found {} clusters and {} noise points ({:.1}%)",
+              cluster_count, noise_count, 100.0 * noise_count as f64 / clusters.len() as f64);
+
+        info!("Computing cluster statistics...");
+        let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
+        let mut cluster_stats = compute_cluster_stats(&read_ids, &clusters, &gc_scores, &damage_score_map);
+
+        for (&cluster_id, stats) in cluster_stats.iter() {
+            if cluster_id == -1 {
+                info!("Noise points: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
+                      stats.num_reads, stats.avg_gc, stats.avg_damage);
+            } else {
+                info!("Cluster {}: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
+                      cluster_id, stats.num_reads, stats.avg_gc, stats.avg_damage);
             }
         }
-    };
-    
-    // Compute cluster statistics
-    let unique_clusters: std::collections::HashSet<isize> = clusters.iter().cloned().collect();
-    let noise_count = clusters.iter().filter(|&&c| c == -1).count();
-    let cluster_count = unique_clusters.len() - (if noise_count > 0 { 1 } else { 0 });
-    
-    info!("DBSCAN complete. Found {} clusters and {} noise points ({:.1}%)", 
-          cluster_count, noise_count, 100.0 * noise_count as f64 / clusters.len() as f64);
-    
-    // Process cluster results
-    info!("Computing cluster statistics...");
-    let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
-    let mut cluster_stats = compute_cluster_stats(&read_ids, &clusters, &gc_scores, &damage_score_map);
-    
-    // Print cluster statistics
-    for (&cluster_id, stats) in cluster_stats.iter() {
-        if cluster_id == -1 {
-            info!("Noise points: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
-                  stats.num_reads, stats.avg_gc, stats.avg_damage);
-        } else {
-            info!("Cluster {}: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
-                  cluster_id, stats.num_reads, stats.avg_gc, stats.avg_damage);
+
+        // Assign taxonomy
+        info!("Assigning taxonomy (similarity threshold: {:.2}, confidence threshold: {:.2})...",
+              args.sim_threshold, args.conf_threshold);
+        let taxonomy = assign_taxonomy(
+            &cluster_stats, &pca_results, &clusters, args.k,
+            args.sim_threshold, args.conf_threshold, args.damage_threshold,
+            &mean, &eigenvectors
+        );
+        for (cluster_id, stat) in cluster_stats.iter_mut() {
+            stat.taxonomy = taxonomy.get(cluster_id).unwrap_or(&"Unassigned".to_string()).clone();
         }
-    }
-    
-    // Assign taxonomy
-    info!("Assigning taxonomy (similarity threshold: {:.2}, confidence threshold: {:.2})...", 
-          args.sim_threshold, args.conf_threshold);
-    let taxonomy = assign_taxonomy(
-        &cluster_stats,
-        &pca_results,
-        &clusters,
-        args.k,
-        args.sim_threshold,
-        args.conf_threshold,
-        args.damage_threshold,
-        &mean,
-        &eigenvectors
-    );
-    
-    for (cluster_id, stat) in cluster_stats.iter_mut() {
-        stat.taxonomy = taxonomy.get(cluster_id).unwrap_or(&"Unassigned".to_string()).clone();
-    }
-    
-    // Generate report
-    info!("Generating cluster report: {}", args.output);
-    if let Err(e) = generate_report(&cluster_stats, &args.output) {
-        error!("Error generating report: {}", e);
-        return Err(format!("Failed to write report: {}", e).into());
+
+        // Generate report
+        info!("Generating cluster report: {}", args.output);
+        if let Err(e) = generate_report(&cluster_stats, &args.output) {
+            error!("Error generating report: {}", e);
+            return Err(format!("Failed to write report: {}", e).into());
+        }
+
+        // Export clusters if requested
+        if args.export_clusters {
+            info!("Exporting cluster sequences...");
+            let file_type = if args.fastq.is_some() { "fastq" } else { "bam" };
+            if file_type == "bam" && args.export_format == "same" {
+                export_bam_clusters(&reads, &clusters, &cluster_stats,
+                    &args.bam.clone().unwrap(), &args)?;
+            } else {
+                export_clusters(&reads, &clusters, &cluster_stats, file_type,
+                    &damage_score_map, &args)?;
+            }
+        }
+
+        // Launch dashboard if requested
+        if args.dashboard {
+            info!("Launching interactive dashboard at http://127.0.0.1:8080");
+            info!("Press Ctrl+C to exit");
+            let sys = actix_web::rt::System::new();
+            sys.block_on(run_dashboard(
+                pca_results, clusters, gc_scores, damage_score_map,
+                read_ids, args.min_samples, eigenvalues, total_features
+            ))?;
+        }
+
+    } else {
+        // =====================================================================
+        // EM PIPELINE (v0.4.0): Robust features → DBSCAN Phase 1 → EM refinement
+        // =====================================================================
+        info!("Running EM iterative clustering pipeline (v0.4.0)");
+
+        // Optional: MEGAHIT assembly pre-step
+        let contigs = if args.assemble {
+            info!("Assembly pre-step enabled (--assemble)");
+            match assembly::run_megahit(&reads, &args.megahit_path) {
+                Ok(contigs) => {
+                    info!("Assembly produced {} contigs", contigs.len());
+                    Some(contigs)
+                }
+                Err(e) => {
+                    warn!("Assembly failed: {}. Proceeding without assembly.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Determine which sequences to cluster
+        // If assembly succeeded, cluster contigs first, then assign reads via EM.
+        // If no assembly, cluster reads directly.
+        let (cluster_seqs, is_contig_mode) = if let Some(ref contigs) = contigs {
+            if contigs.len() >= 10 {
+                info!("Using {} contigs as primary clustering targets", contigs.len());
+                (contigs.clone(), true)
+            } else {
+                warn!("Too few contigs ({}). Falling back to read-level clustering.", contigs.len());
+                (reads.clone(), false)
+            }
+        } else {
+            (reads.clone(), false)
+        };
+
+        // Phase 1: Build robust feature matrix (18 dims)
+        info!("Phase 1: Computing robust per-{} features...",
+              if is_contig_mode { "contig" } else { "read" });
+
+        let cluster_gc: HashMap<String, f64> = if is_contig_mode {
+            // Compute GC for contigs
+            cluster_seqs.iter()
+                .map(|r| (r.id.clone(), compute_gc_content(&r.seq)))
+                .collect()
+        } else {
+            gc_scores.clone()
+        };
+
+        let initial_features = build_initial_feature_matrix(&cluster_seqs, &cluster_gc);
+        info!("Initial feature matrix: {} × {} (sequences × features)",
+              initial_features.nrows(), initial_features.ncols());
+
+        // Phase 1: Coarse DBSCAN clustering on robust features
+        // Use a smaller min_samples for the coarse step (we want many small clusters)
+        let coarse_min_samples = std::cmp::max(3, args.min_samples / 2);
+        let initial_clusters = coarse_initial_clustering(
+            &initial_features,
+            coarse_min_samples,
+            args.eps,
+            args.auto_epsilon,
+        );
+
+        // Phase 2-4: Compute k=4 count vectors and run EM
+        info!("Phase 2: Computing k=4 count vectors for {} sequences...", cluster_seqs.len());
+        let kmer_counts = precompute_kmer_counts(&cluster_seqs, 4);
+
+        let gc_values: Vec<f64> = cluster_seqs.iter()
+            .map(|r| cluster_gc.get(&r.id).copied().unwrap_or(0.5))
+            .collect();
+
+        info!("Phase 3-4: Starting EM iterative refinement...");
+        let mut em = em_clustering::EMClusterer::new(
+            &initial_clusters,
+            &kmer_counts,
+            &gc_values,
+            4, // k=4 for tetranucleotide profiles
+            args.min_cluster_size,
+            0.5, // Jeffreys prior pseudocount
+        );
+
+        let em_clusters = em.run(
+            &kmer_counts,
+            &gc_values,
+            args.em_iterations,
+            args.em_convergence,
+            args.merge_threshold,
+        );
+
+        // If we clustered contigs, map reads back to contig clusters via EM
+        let clusters: Vec<isize> = if is_contig_mode {
+            info!("Mapping reads back to contig-defined clusters via multinomial likelihood...");
+            let read_kmer_counts = precompute_kmer_counts(&reads, 4);
+
+            // Assign each read to the best-matching cluster profile
+            read_kmer_counts.par_iter()
+                .map(|counts| {
+                    let mut best_cluster: isize = -1;
+                    let mut best_ll = f64::NEG_INFINITY;
+
+                    for profile in &em.profiles {
+                        let ll = em_clustering::multinomial_log_likelihood(counts, &profile.log_probs);
+                        if ll > best_ll {
+                            best_ll = ll;
+                            best_cluster = profile.cluster_id as isize;
+                        }
+                    }
+                    best_cluster
+                })
+                .collect()
+        } else {
+            em_clusters
+        };
+
+        // Cluster statistics
+        let unique_clusters: HashSet<isize> = clusters.iter().cloned().collect();
+        let noise_count = clusters.iter().filter(|&&c| c == -1).count();
+        let cluster_count = unique_clusters.len() - (if noise_count > 0 { 1 } else { 0 });
+        info!("EM clustering complete. Found {} clusters ({} total reads, {} noise ({:.1}%))",
+              cluster_count, clusters.len(), noise_count,
+              100.0 * noise_count as f64 / clusters.len().max(1) as f64);
+
+        // Log EM convergence summary
+        if let Some(&final_ll) = em.log_likelihood_history.last() {
+            info!("Final total log-likelihood: {:.2}", final_ll);
+        }
+        info!("EM completed in {} iterations", em.log_likelihood_history.len());
+
+        info!("Computing cluster statistics...");
+        let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
+        let mut cluster_stats = compute_cluster_stats(&read_ids, &clusters, &gc_scores, &damage_score_map);
+
+        for (&cluster_id, stats) in cluster_stats.iter() {
+            if cluster_id == -1 {
+                info!("Noise points: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
+                      stats.num_reads, stats.avg_gc, stats.avg_damage);
+            } else {
+                info!("Cluster {}: {} reads, Avg GC: {:.4}, Avg Damage: {:.4}",
+                      cluster_id, stats.num_reads, stats.avg_gc, stats.avg_damage);
+            }
+        }
+
+        // Taxonomy: EM path uses compositional profiles, not PCA-based assignment
+        // For now, mark clusters as "Unassigned" (taxonomy redesign is a separate task)
+        for (_cluster_id, stat) in cluster_stats.iter_mut() {
+            stat.taxonomy = "Unassigned".to_string();
+        }
+
+        // Generate report
+        info!("Generating cluster report: {}", args.output);
+        if let Err(e) = generate_report(&cluster_stats, &args.output) {
+            error!("Error generating report: {}", e);
+            return Err(format!("Failed to write report: {}", e).into());
+        }
+
+        // Export clusters if requested
+        if args.export_clusters {
+            info!("Exporting cluster sequences...");
+            let file_type = if args.fastq.is_some() { "fastq" } else { "bam" };
+            if file_type == "bam" && args.export_format == "same" {
+                export_bam_clusters(&reads, &clusters, &cluster_stats,
+                    &args.bam.clone().unwrap(), &args)?;
+            } else {
+                export_clusters(&reads, &clusters, &cluster_stats, file_type,
+                    &damage_score_map, &args)?;
+            }
+        }
+
+        // Dashboard not yet supported for EM pipeline (no PCA data)
+        if args.dashboard {
+            warn!("Dashboard is not yet supported with the EM pipeline. Use --legacy for dashboard.");
+            warn!("The cluster report has been generated at: {}", args.output);
+        }
     }
 
-    // Export clusters if requested
-    if args.export_clusters {
-        info!("Exporting cluster sequences...");
-        let file_type = if args.fastq.is_some() { "fastq" } else { "bam" };
-        
-        // For BAM exports, use the specialized function
-        if file_type == "bam" && args.export_format == "same" {
-            export_bam_clusters(
-                &reads, 
-                &clusters, 
-                &cluster_stats, 
-                &args.bam.clone().unwrap(),
-                &args
-            )?;
-        } else {
-            // For FASTQ or FASTA exports
-            export_clusters(
-                &reads,
-                &clusters,
-                &cluster_stats,
-                file_type,
-                &damage_score_map,
-                &args
-            )?;
-        }
-    }
-    
-    // Launch dashboard if requested
-    if args.dashboard {
-        info!("Launching interactive dashboard at http://127.0.0.1:8080");
-        info!("Press Ctrl+C to exit");
-        
-        let sys = actix_web::rt::System::new();
-        sys.block_on(run_dashboard(
-            pca_results,
-            clusters,
-            gc_scores,
-            damage_score_map,
-            read_ids,
-            args.min_samples,
-            eigenvalues,
-            total_features
-        ))?;
-    }
-    
     Ok(())
 }
 
