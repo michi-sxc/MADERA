@@ -1,4 +1,4 @@
-//! EM Iterative Clustering Module for MADERA v0.4.0
+//! EM Iterative Clustering Module for MADERA v0.4.1
 //!
 //! Implements expectation-maximization based clustering using multinomial
 //! k-mer profiles. The EM approach correctly handles the noise inherent in
@@ -142,10 +142,15 @@ pub fn jensen_shannon_divergence(p: &[f64], q: &[f64]) -> f64 {
     jsd.max(0.0)
 }
 
+pub fn compute_bic(total_ll: f64, n_clusters: usize, num_kmers: usize, n_reads: usize) -> f64 {
+    let n_params = n_clusters * (num_kmers - 1) + (n_clusters - 1);
+    -2.0 * total_ll + (n_params as f64) * (n_reads as f64).ln()
+}
+
 impl EMClusterer {
     /// Create a new EMClusterer from initial cluster assignments.
     ///
-    /// `initial_assignments`: cluster label per read (from Phase 1 DBSCAN).
+    /// `initial_assignments`: cluster label per read (from Phase 1 K-means++).
     ///   Noise points (label -1) are assigned to the nearest non-noise cluster
     ///   based on GC content proximity.
     /// `read_kmer_counts`: pre-computed k=4 count vectors per read.
@@ -304,6 +309,118 @@ impl EMClusterer {
         }
     }
 
+    fn try_bic_merge(
+        &mut self,
+        read_kmer_counts: &[Vec<u16>],
+        gc_values: &[f64],
+    ) -> bool {
+        let n_clusters = self.profiles.len();
+        if n_clusters <= 1 {
+            return false;
+        }
+
+        let n_reads = read_kmer_counts.len();
+
+        // Current total LL and BIC
+        let current_ll = self.compute_total_log_likelihood(read_kmer_counts);
+        let current_bic = compute_bic(current_ll, n_clusters, self.num_kmers, n_reads);
+
+        // Find the most similar pair (lowest JSD)
+        let mut best_i = 0;
+        let mut best_j = 1;
+        let mut min_jsd = f64::INFINITY;
+
+        for i in 0..n_clusters {
+            for j in (i + 1)..n_clusters {
+                let jsd = jensen_shannon_divergence(
+                    &self.profiles[i].kmer_probs,
+                    &self.profiles[j].kmer_probs,
+                );
+                if jsd < min_jsd {
+                    min_jsd = jsd;
+                    best_i = i;
+                    best_j = j;
+                }
+            }
+        }
+
+        // Collect read indices for both clusters
+        let reads_i: Vec<usize> = self.assignments.iter()
+            .enumerate()
+            .filter(|(_, &a)| a == best_i)
+            .map(|(idx, _)| idx)
+            .collect();
+        let reads_j: Vec<usize> = self.assignments.iter()
+            .enumerate()
+            .filter(|(_, &a)| a == best_j)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        // Build merged profile from combined reads
+        let mut reads_merged = reads_i.clone();
+        reads_merged.extend(&reads_j);
+        let merged_profile = self.build_profile_for_subset(
+            &reads_merged, read_kmer_counts, gc_values,
+        );
+
+        // Compute LL change for affected reads only:
+        // new_total_ll = current_ll
+        //   - LL(reads_i under profile_i)  - LL(reads_j under profile_j)
+        //   + LL(reads_i ∪ reads_j under merged_profile)
+        let old_ll_i: f64 = reads_i.iter()
+            .map(|&r| multinomial_log_likelihood(&read_kmer_counts[r], &self.profiles[best_i].log_probs))
+            .sum();
+        let old_ll_j: f64 = reads_j.iter()
+            .map(|&r| multinomial_log_likelihood(&read_kmer_counts[r], &self.profiles[best_j].log_probs))
+            .sum();
+        let new_ll_merged: f64 = reads_merged.iter()
+            .map(|&r| multinomial_log_likelihood(&read_kmer_counts[r], &merged_profile.log_probs))
+            .sum();
+
+        let new_total_ll = current_ll - old_ll_i - old_ll_j + new_ll_merged;
+        let new_bic = compute_bic(new_total_ll, n_clusters - 1, self.num_kmers, n_reads);
+
+        let delta_bic = new_bic - current_bic;
+
+        if new_bic < current_bic {
+            // Accept merge: reassign reads from best_j to best_i, collapse indices
+            info!("BIC merge: clusters {} (n={}, GC={:.3}) + {} (n={}, GC={:.3}) → merged \
+                   (JSD={:.4}, ΔBIC={:.0}, {} → {} clusters)",
+                  best_i, reads_i.len(), self.profiles[best_i].gc_mean,
+                  best_j, reads_j.len(), self.profiles[best_j].gc_mean,
+                  min_jsd, delta_bic, n_clusters, n_clusters - 1);
+
+            // Reassign: best_j → best_i, shift indices above best_j down by 1
+            for a in self.assignments.iter_mut() {
+                if *a == best_j {
+                    *a = best_i;
+                }
+                if *a > best_j {
+                    *a -= 1;
+                }
+            }
+
+            // Remove the dissolved profile
+            self.profiles.remove(best_j);
+
+            // Rebuild all profiles from updated assignments
+            self.profiles = (0..self.profiles.len())
+                .map(|c| {
+                    Self::build_profile_from_reads(
+                        c, read_kmer_counts, gc_values, &self.assignments,
+                        c, self.num_kmers, self.pseudocount,
+                    )
+                })
+                .collect();
+
+            true
+        } else {
+            info!("BIC merge stopped at {} clusters (best pair: {} + {}, JSD={:.4}, ΔBIC=+{:.0})",
+                  n_clusters, best_i, best_j, min_jsd, delta_bic);
+            false
+        }
+    }
+
     /// E-step: Assign each read to the cluster with highest multinomial
     /// log-likelihood.
     ///
@@ -404,237 +521,6 @@ impl EMClusterer {
         self.profiles = new_profiles;
     }
 
-    /// Merge clusters whose k-mer profiles are too similar.
-    ///
-    /// Uses Jensen-Shannon divergence as the similarity metric.
-    /// When two clusters are below the threshold, the smaller one is
-    /// absorbed into the larger one. Profiles and assignments are
-    /// updated accordingly.
-    fn merge_similar_clusters(
-        &mut self,
-        read_kmer_counts: &[Vec<u16>],
-        gc_values: &[f64],
-        threshold: f64,
-    ) {
-        if self.profiles.len() <= 1 {
-            return;
-        }
-
-        let n = self.profiles.len();
-        let mut merge_into: Vec<usize> = (0..n).collect(); // Union-find parent
-
-        // Compute pairwise JSD and mark merges
-        for i in 0..n {
-            for j in (i + 1)..n {
-                let jsd = jensen_shannon_divergence(
-                    &self.profiles[i].kmer_probs,
-                    &self.profiles[j].kmer_probs,
-                );
-
-                if jsd < threshold {
-                    // Merge smaller into larger
-                    let (keep, dissolve) = if self.profiles[i].read_count >= self.profiles[j].read_count {
-                        (i, j)
-                    } else {
-                        (j, i)
-                    };
-
-                    // Follow chain to find root
-                    let root_keep = Self::find_root(&merge_into, keep);
-                    let root_dissolve = Self::find_root(&merge_into, dissolve);
-                    if root_keep != root_dissolve {
-                        merge_into[root_dissolve] = root_keep;
-                    }
-                }
-            }
-        }
-
-        // Check if any merges happened
-        let any_merges = merge_into.iter().enumerate().any(|(i, &p)| p != i);
-        if !any_merges {
-            return;
-        }
-
-        // Resolve all roots
-        let roots: Vec<usize> = (0..n).map(|i| Self::find_root(&merge_into, i)).collect();
-
-        // Remap to contiguous indices
-        let unique_roots: Vec<usize> = {
-            let mut seen = std::collections::HashSet::new();
-            roots.iter().filter(|&&r| seen.insert(r)).copied().collect()
-        };
-        let root_to_new: std::collections::HashMap<usize, usize> = unique_roots.iter()
-            .enumerate()
-            .map(|(new_idx, &root)| (root, new_idx))
-            .collect();
-
-        let merged_count = n - unique_roots.len();
-        if merged_count > 0 {
-            info!("EM: Merged {} clusters (JSD < {:.4}), {} → {} clusters",
-                  merged_count, threshold, n, unique_roots.len());
-        }
-
-        // Remap assignments
-        self.assignments = self.assignments.iter()
-            .map(|&c| {
-                let root = roots[c];
-                *root_to_new.get(&root).unwrap_or(&0)
-            })
-            .collect();
-
-        // Rebuild profiles from merged assignments
-        let new_n = unique_roots.len();
-        self.profiles = (0..new_n)
-            .map(|c| {
-                Self::build_profile_from_reads(
-                    c, read_kmer_counts, gc_values, &self.assignments,
-                    c, self.num_kmers, self.pseudocount,
-                )
-            })
-            .collect();
-    }
-
-    /// Split clusters that contain heterogeneous organisms.
-    ///
-    /// Detection: If a cluster's GC std dev > 0.03, it may contain organisms
-    /// with different GC content (e.g., M. tuberculosis at 66% mixed with
-    /// E. coli at 51%). For such candidates, run 2-means on their k-mer
-    /// count vectors and validate the split via JSD.
-    ///
-    /// Only splits if the two sub-clusters have JSD > merge_threshold,
-    /// ensuring consistency: "different enough to not merge" = "different
-    /// enough to split."
-    fn split_heterogeneous_clusters(
-        &mut self,
-        read_kmer_counts: &[Vec<u16>],
-        gc_values: &[f64],
-        merge_threshold: f64,
-    ) {
-        let gc_std_threshold = 0.03;
-        let min_split_size = 20; // Don't split tiny clusters
-
-        // Collect candidates
-        let n_clusters = self.profiles.len();
-        let mut splits_to_apply: Vec<(usize, Vec<usize>, Vec<usize>)> = Vec::new();
-
-        for c in 0..n_clusters {
-            // Gather reads in this cluster
-            let read_indices: Vec<usize> = self.assignments.iter()
-                .enumerate()
-                .filter(|(_, &a)| a == c)
-                .map(|(i, _)| i)
-                .collect();
-
-            if read_indices.len() < min_split_size * 2 {
-                continue; // Too small to split meaningfully
-            }
-
-            // Fast screen: GC standard deviation
-            let gc_mean = read_indices.iter()
-                .map(|&i| gc_values[i])
-                .sum::<f64>() / read_indices.len() as f64;
-            let gc_var = read_indices.iter()
-                .map(|&i| (gc_values[i] - gc_mean).powi(2))
-                .sum::<f64>() / read_indices.len() as f64;
-            let gc_std = gc_var.sqrt();
-
-            if gc_std <= gc_std_threshold {
-                continue; // Homogeneous cluster
-            }
-
-            // Candidate! Run 2-means on k-mer counts
-            let subset_counts: Vec<Vec<u16>> = read_indices.iter()
-                .map(|&i| read_kmer_counts[i].clone())
-                .collect();
-
-            let sub_assignments = two_means_split(&subset_counts, 20);
-
-            // Separate into two groups
-            let group0: Vec<usize> = sub_assignments.iter().enumerate()
-                .filter(|(_, &a)| a == 0)
-                .map(|(i, _)| read_indices[i])
-                .collect();
-            let group1: Vec<usize> = sub_assignments.iter().enumerate()
-                .filter(|(_, &a)| a == 1)
-                .map(|(i, _)| read_indices[i])
-                .collect();
-
-            // Both groups must be large enough
-            if group0.len() < min_split_size || group1.len() < min_split_size {
-                continue;
-            }
-
-            // Build profiles for each sub-cluster and check JSD
-            let profile0 = self.build_profile_for_subset(
-                &group0, read_kmer_counts, gc_values,
-            );
-            let profile1 = self.build_profile_for_subset(
-                &group1, read_kmer_counts, gc_values,
-            );
-
-            let jsd = jensen_shannon_divergence(&profile0.kmer_probs, &profile1.kmer_probs);
-
-            if jsd > merge_threshold {
-                info!("EM split: Cluster {} (n={}, GC_std={:.4}) splitting into {} + {} reads (JSD={:.4})",
-                      c, read_indices.len(), gc_std, group0.len(), group1.len(), jsd);
-                splits_to_apply.push((c, group0, group1));
-            }
-        }
-
-        if splits_to_apply.is_empty() {
-            return;
-        }
-
-        // Apply splits: keep original cluster for group0, create new cluster for group1
-        for (_original_cluster, _group0, group1) in &splits_to_apply {
-            let new_cluster_idx = self.profiles.len();
-
-            // Reassign group1 reads to the new cluster
-            for &read_idx in group1 {
-                self.assignments[read_idx] = new_cluster_idx;
-            }
-
-            // Add a placeholder profile (will be rebuilt)
-            self.profiles.push(ClusterProfile {
-                cluster_id: new_cluster_idx,
-                kmer_probs: vec![1.0 / self.num_kmers as f64; self.num_kmers],
-                log_probs: vec![(1.0 / self.num_kmers as f64).ln(); self.num_kmers],
-                read_count: group1.len(),
-                gc_mean: 0.0,
-            });
-        }
-
-        // Rebuild all profiles from updated assignments
-        let n_new_clusters = self.profiles.len();
-        self.profiles = (0..n_new_clusters)
-            .map(|c| {
-                Self::build_profile_from_reads(
-                    c, read_kmer_counts, gc_values, &self.assignments,
-                    c, self.num_kmers, self.pseudocount,
-                )
-            })
-            .filter(|p| p.read_count > 0)
-            .collect();
-
-        // Remap assignments to contiguous indices
-        let id_map: std::collections::HashMap<usize, usize> = self.profiles.iter()
-            .enumerate()
-            .map(|(new_idx, p)| (p.cluster_id, new_idx))
-            .collect();
-
-        for a in self.assignments.iter_mut() {
-            if let Some(&new_idx) = id_map.get(a) {
-                *a = new_idx;
-            }
-        }
-
-        // Fix cluster_ids to be contiguous
-        for (i, p) in self.profiles.iter_mut().enumerate() {
-            p.cluster_id = i;
-        }
-
-        info!("EM: Applied {} splits, now {} clusters", splits_to_apply.len(), self.profiles.len());
-    }
 
     /// Build a ClusterProfile from a subset of read indices.
     fn build_profile_for_subset(
@@ -672,14 +558,7 @@ impl EMClusterer {
         }
     }
 
-    /// Union-find: follow parent chain to root.
-    fn find_root(parents: &[usize], mut node: usize) -> usize {
-        while parents[node] != node {
-            node = parents[node];
-        }
-        node
-    }
-
+    
     /// Compute the total log-likelihood of all reads under their current
     /// cluster assignments.
     fn compute_total_log_likelihood(&self, read_kmer_counts: &[Vec<u16>]) -> f64 {
@@ -713,69 +592,88 @@ impl EMClusterer {
         gc_values: &[f64],
         max_iterations: usize,
         convergence_threshold: f64,
-        merge_threshold: f64,
+        _merge_threshold: f64, // Deprecated: BIC replaces threshold-based merge
     ) -> Vec<isize> {
-        info!("Starting EM iterative clustering (max_iter={}, conv={}, merge_jsd={})",
-              max_iterations, convergence_threshold, merge_threshold);
+        let min_iterations: usize = 5;
+
+        // Compute initial BIC for logging
+        let init_ll = self.compute_total_log_likelihood(read_kmer_counts);
+        let init_bic = compute_bic(init_ll, self.profiles.len(), self.num_kmers, read_kmer_counts.len());
+        info!("Starting EM with BIC-guided merge (max_iter={}, conv={}, min_iter={})",
+              max_iterations, convergence_threshold, min_iterations);
+        info!("Initial state: {} clusters, LL={:.2}, BIC={:.0}",
+              self.profiles.len(), init_ll, init_bic);
 
         for iteration in 0..max_iterations {
-            // E-step
+            // === E-step ===
             let new_assignments = self.e_step(read_kmer_counts);
 
-            // Count how many reads changed cluster
             let changes: usize = new_assignments.iter()
                 .zip(self.assignments.iter())
                 .filter(|(&new, &old)| new != old)
                 .count();
 
-            // M-step
+            // === M-step ===
             self.m_step(read_kmer_counts, gc_values, &new_assignments);
 
-            // Merge similar clusters (only after iteration 3 to let profiles stabilize;
-            // merging too early when profiles are noisy can permanently collapse distinct clusters)
-            if iteration >= 3 {
-                self.merge_similar_clusters(read_kmer_counts, gc_values, merge_threshold);
-                self.split_heterogeneous_clusters(read_kmer_counts, gc_values, merge_threshold);
+            // === BIC-guided merge: greedily merge until no improvement ===
+            let pre_merge_count = self.profiles.len();
+            let mut merges_this_iter = 0;
+            while self.try_bic_merge(read_kmer_counts, gc_values) {
+                merges_this_iter += 1;
             }
+            let post_merge_count = self.profiles.len();
 
-            // Compute total log-likelihood
+            // === Compute log-likelihood and BIC ===
             let total_ll = self.compute_total_log_likelihood(read_kmer_counts);
+            let bic = compute_bic(total_ll, self.profiles.len(), self.num_kmers, read_kmer_counts.len());
             self.log_likelihood_history.push(total_ll);
 
-            // Log progress
-            info!("EM iteration {}: {} clusters, {} reads changed, total LL = {:.2}",
-                  iteration + 1, self.profiles.len(), changes, total_ll);
+            // === Log progress ===
+            let merge_note = if merges_this_iter > 0 {
+                format!(" (merged {} → {})", pre_merge_count, post_merge_count)
+            } else {
+                String::new()
+            };
+            info!("EM iteration {}: {} clusters{}, {} reads changed, LL={:.2}, BIC={:.0}",
+                  iteration + 1, self.profiles.len(), merge_note, changes, total_ll, bic);
 
             for profile in &self.profiles {
                 info!("  Cluster {}: {} reads, GC={:.3}",
                       profile.cluster_id, profile.read_count, profile.gc_mean);
             }
 
-            // Check convergence
-            if self.log_likelihood_history.len() >= 2 {
-                let prev_ll = self.log_likelihood_history[self.log_likelihood_history.len() - 2];
-                let delta = (total_ll - prev_ll).abs();
-                let relative_delta = if total_ll.abs() > 1e-10 {
-                    delta / total_ll.abs()
-                } else {
-                    delta
-                };
-
-                if relative_delta < convergence_threshold {
-                    info!("EM converged after {} iterations (relative ΔLL = {:.6})",
-                          iteration + 1, relative_delta);
+            // === Convergence check (only after min_iterations and no merges) ===
+            if merges_this_iter == 0 && iteration + 1 >= min_iterations {
+                if changes == 0 {
+                    info!("EM converged after {} iterations (no assignment changes)", iteration + 1);
                     break;
                 }
-            }
 
-            // Also check if no reads changed (hard convergence)
-            if changes == 0 {
-                info!("EM converged after {} iterations (no assignment changes)", iteration + 1);
-                break;
+                if self.log_likelihood_history.len() >= 2 {
+                    let prev_ll = self.log_likelihood_history[self.log_likelihood_history.len() - 2];
+                    let delta = (total_ll - prev_ll).abs();
+                    let relative_delta = if total_ll.abs() > 1e-10 {
+                        delta / total_ll.abs()
+                    } else {
+                        delta
+                    };
+
+                    if relative_delta < convergence_threshold {
+                        info!("EM converged after {} iterations (relative ΔLL = {:.6})",
+                              iteration + 1, relative_delta);
+                        break;
+                    }
+                }
             }
         }
 
-        // Convert to isize for compatibility with existing pipeline
+        // Final summary
+        let final_ll = self.compute_total_log_likelihood(read_kmer_counts);
+        let final_bic = compute_bic(final_ll, self.profiles.len(), self.num_kmers, read_kmer_counts.len());
+        info!("EM complete: {} clusters, LL={:.2}, BIC={:.0} (started at BIC={:.0})",
+              self.profiles.len(), final_ll, final_bic, init_bic);
+
         self.assignments.iter().map(|&a| a as isize).collect()
     }
 }

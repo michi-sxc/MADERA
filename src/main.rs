@@ -2,7 +2,7 @@
 //!
 //! This program performs quality control, feature extraction (including k-mer frequencies,
 //! optional codon usage, GC content, and damage scores), PCA dimensionality reduction,
-//! and clustering using HDBSCAN initial seeding with EM iterative refinement.
+//! and clustering using K-means++ initial seeding with EM iterative refinement.
 //! 
 //! Michael Schneider 2026
 //! https://github.com/michi-sxc/MADERA
@@ -69,9 +69,9 @@ struct Args {
     #[arg(long, default_value_t = false)]
     dashboard: bool,
 
-    /// Minimum cluster size for HDBSCAN initial clustering (default: 5)
-    #[arg(long, default_value_t = 5)]
-    min_samples: usize,
+    /// Number of initial K-means clusters for Phase 1 seeding (default: 15)
+    #[arg(long, default_value_t = 15)]
+    n_init_clusters: usize,
 
     /// Number of PCA components for dimensionality reduction (default: 8)
     #[arg(long, default_value_t = 8)]
@@ -121,7 +121,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     export_with_metadata: bool,
 
-    // === EM Clustering (v0.4.0) ===
+    // === EM Clustering (v0.4.1) ===
 
     /// Maximum EM iterations for iterative clustering (default: 20)
     #[arg(long, default_value_t = 20)]
@@ -150,6 +150,9 @@ struct Args {
     /// Use legacy v0.3.1 DBSCAN pipeline instead of EM clustering
     #[arg(long, default_value_t = false)]
     legacy: bool,
+
+    #[arg(long, default_value_t = 42)]
+    seed: u64,
 }
 
 #[derive(Serialize, Clone)]
@@ -166,10 +169,6 @@ struct DashboardData {
     damage_combined: Vec<f64>,
     damage5: Vec<f64>,
     damage3: Vec<f64>,
-    
-    // Clustering data
-    k_distance: Vec<f64>,
-    optimal_eps: f64,
     
     // Cluster statistics
     cluster_stats: Vec<ClusterSummary>,
@@ -1418,78 +1417,7 @@ fn fit_optimized_decay_model(deam_sites: &[(usize, f64)]) -> ExponentialModel {
 
 
 
-/// Calculate damage scores for ancient DNA reads
-#[allow(dead_code)]
-fn damage_assessment(reads: &[Read], window_size: usize) -> HashMap<String, DamageScore> {
-    use rayon::prelude::*;
-    use std::sync::{Arc, Mutex};
-    use indicatif::{ProgressBar, ProgressStyle};
-    
-    let total_reads = reads.len();
-    let pb = Arc::new(ProgressBar::new(total_reads as u64));
-    pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} reads processed (Damage assessment)"
-        )
-        .unwrap()
-        .progress_chars("##-")
-    );
-    
-    let processed_count = Arc::new(Mutex::new(0));
-    
-    // Pre-allocate the results hashmap
-    let damage_scores = Arc::new(Mutex::new(HashMap::with_capacity(total_reads)));
-    
-    let chunk_size = std::cmp::max(1, total_reads / rayon::current_num_threads());
-    
-    let chunks: Vec<_> = reads.chunks(chunk_size).collect();
-    
-    chunks.par_iter().for_each(|chunk| {
-        let mut local_scores = HashMap::with_capacity(chunk.len());
-        
-        // Process each read in the chunk
-        for (i, read) in chunk.iter().enumerate() {
-            let damage = compute_damage_scores(read, window_size);
-            local_scores.insert(read.id.clone(), damage);
-            
-            // Periodically update progress for very large chunks
-            if i % 10 == 0 && chunk.len() > 100 {
-                let pb_clone = Arc::clone(&pb);
-                let processed = Arc::clone(&processed_count);
-                let mut count = processed.lock().unwrap();
-                *count += 10;
-                pb_clone.set_position(*count as u64);
-            }
-        }
-        
-        // Update the global scores
-        let mut scores = damage_scores.lock().unwrap();
-        scores.extend(local_scores);
-        
-        // Final progress update for this chunk
-        let pb_clone = Arc::clone(&pb);
-        let processed = Arc::clone(&processed_count);
-        let mut count = processed.lock().unwrap();
-        
-        // Only count remaining reads that weren't already counted in the periodic updates
-        let remaining = chunk.len() - (chunk.len() / 10) * 10;
-        *count += remaining;
-        
-        pb_clone.set_position(*count as u64);
-    });
-    
-    pb.finish_with_message("Damage assessment complete");
-    
-    // Return the results
-    let result = Arc::try_unwrap(damage_scores)
-        .expect("Failed to unwrap Arc")
-        .into_inner()
-        .expect("Failed to unwrap Mutex");
-    
-    result
-}
-
-// Add this debugging helper function 
+// Add this debugging helper function
 fn debug_damage_computation(read: &Read, window_size: usize) -> DamageScore {
     // Add timestamps for benchmarking each step
     let start = std::time::Instant::now();
@@ -1536,78 +1464,6 @@ fn debug_damage_computation(read: &Read, window_size: usize) -> DamageScore {
         damage3: combined_score.prime3_score,
         combined: combined_score.authenticity_score,
     }
-}
-
-/// Enhanced structs needed for the new damage assessment (some parameters are still unused)
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct DamagePosition {
-    position: usize,
-    base: char,
-    context: String,
-    quality: Option<u8>,
-    damage_prob: f64,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-struct DamagePattern {
-    positions: Vec<DamagePosition>,
-    decay_rate: f64,
-    change_point: Option<usize>,
-    log_likelihood_ratio: f64,
-}
-
-
-/// Main damage assessment function - integrates multiple methods
-#[allow(dead_code)]
-fn compute_damage_scores(read: &Read, window_size: usize) -> DamageScore {
-    // Get the max window size to analyze (we'll use a dynamic approach)
-    let max_window = std::cmp::min(window_size * 3, read.seq.len() / 4);
-    
-    // 1. First approach: Change point analysis
-    let change_point_results = detect_damage_change_points(read, max_window);
-    
-    // 2. Second approach: Position-specific decay model
-    let decay_model_results = fit_decay_damage_model(read, max_window);
-    
-    // 3. Third approach: Read pair overlap analysis if paired data is available
-    // This would be implemented via a cache of read pairs - we simulate it here
-    let read_pair_results = analyze_read_pair_overlaps(read);
-    
-    // 4. Combine results using an ensemble approach
-    let combined_score = combine_damage_evidence(
-        &change_point_results, 
-        &decay_model_results,
-        &read_pair_results,
-        read
-    );
-    
-    // Better damage scoring logic than in v0.1.0:
-    // If we couldn't find a read pair but the change point and decay model
-    // provide strong signals, still assign a reasonable damage score
-    let final_damage = if read_pair_results.has_overlap {
-        // We have paired read data, use the full combined score
-        DamageScore {
-            damage5: combined_score.prime5_score,
-            damage3: combined_score.prime3_score,
-            combined: combined_score.authenticity_score,
-        }
-    } else {
-        // No paired data, but we can still estimate damage
-        // Compute a slightly reduced score based only on single-read methods
-        let damage5 = combined_score.prime5_score * 0.9;
-        let damage3 = combined_score.prime3_score * 0.9;
-        let combined = damage5 * 0.5 + damage3 * 0.5;
-        
-        DamageScore {
-            damage5,
-            damage3,
-            combined,
-        }
-    };
-    
-    final_damage
 }
 
 /// APPROACH 1: Change-point analysis for damage detection
@@ -1959,25 +1815,6 @@ impl ReadPairCache {
             overlap_results: RwLock::new(HashMap::new()),
             unprocessed_pairs: Mutex::new(HashSet::new()),
             stats: Mutex::new(CacheStats::default()),
-        }
-    }
-    /// Prune old entries from the cache when it grows too large
-    #[allow(dead_code)]
-    fn prune_cache(&self, max_size: usize) {
-        let mut cache = self.cache.write().unwrap();
-        if cache.len() > max_size {
-            // Remove oldest entries first (would typically use an LRU strategy)
-            // This simplified version just keeps the most recent entries
-            let mut entries: Vec<_> = cache.drain().collect();
-            entries.sort_by(|(_, a), (_, b)| {
-                // Sort by most recently added/updated
-                a.processed.cmp(&b.processed).reverse()
-            });
-            
-            // Keep only the max_size most recent entries
-            for (k, v) in entries.into_iter().take(max_size) {
-                cache.insert(k, v);
-            }
         }
     }
     // Completely redone add_read method to fix all ownership issues
@@ -2863,7 +2700,7 @@ fn compute_codon_usage(seq: &str) -> HashMap<String, f64> {
 }
 
 // ============================================================================
-// EM Pipeline Helper Functions (v0.4.0)
+// EM Pipeline Helper Functions (v0.4.1)
 // ============================================================================
 
 /// Build the 18-dimensional initial feature matrix for Phase 1 coarse clustering.
@@ -2967,9 +2804,10 @@ fn precompute_kmer_counts(reads: &[Read], k: usize) -> Vec<Vec<u16>> {
 ///
 /// Reduces the 18D robust feature space (GC + dinucleotides + length) to
 /// `n_components` dimensions (default 8). This mitigates curse-of-dimensionality
-/// effects in the subsequent HDBSCAN clustering while preserving >95% of
-/// the biological variance (GC content dominates PC1, dinucleotide patterns
-/// drive PCs 2-8).
+/// effects in the subsequent clustering while preserving >95% of
+/// the biological variance. GC content dominates PC1, dinucleotide patterns
+/// drive PCs 2-8. The reduced features are passed to K-means++ for initial
+/// clustering, which works well even in 8D unlike density-based methods.
 fn pca_reduce_features(
     features: &ndarray::Array2<f64>,
     n_components: usize,
@@ -3037,53 +2875,148 @@ fn pca_reduce_features(
     centered.dot(&projection)
 }
 
-/// Phase 1: HDBSCAN clustering on PCA-reduced robust features.
+/// Phase 1: K-means++ initial clustering on z-scored robust features.
 ///
-/// Replaces the original DBSCAN approach which suffered from
-/// curse-of-dimensionality in 18D. HDBSCAN uses mutual reachability
-/// distance and hierarchical density extraction, which naturally
-/// adapts to local density variations without requiring an epsilon parameter.
-fn hdbscan_initial_clustering(
+/// Replaces HDBSCAN which suffered from curse-of-dimensionality issues even
+/// after PCA reduction. K-means works well in moderate dimensions because it
+/// relies on centroid distances rather than local density estimation.
+///
+/// Uses K-means++ initialization for better starting centroids, then runs
+/// standard Lloyd's iterations. The generous over-splitting (k=15-20) is
+/// intentional — the EM merge step (JSD < 0.05) will consolidate redundant
+/// clusters, while ensuring each distinct organism gets at least one seed.
+///
+/// Returns cluster labels as Vec<isize> (0-indexed, no noise points).
+fn kmeans_initial_clustering(
     features: &ndarray::Array2<f64>,
-    min_cluster_size: usize,
+    k: usize,
+    max_iter: usize,
+    seed: u64,
 ) -> Vec<isize> {
-    use hdbscan::Hdbscan;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::Rng;
 
     let n_reads = features.nrows();
     let n_dims = features.ncols();
-    info!("Phase 1: HDBSCAN clustering on {}-dim features ({} reads, min_cluster_size={})",
-          n_dims, n_reads, min_cluster_size);
 
-    // Convert ndarray to Vec<Vec<f64>> for hdbscan crate
-    let data: Vec<Vec<f64>> = (0..n_reads)
-        .map(|i| features.row(i).to_vec())
-        .collect();
+    info!(
+        "Phase 1: K-means++ clustering on {}-dim features ({} reads, k={}, seed={})",
+        n_dims, n_reads, k, seed
+    );
 
-    // Configure HDBSCAN
-    let hyper_params = hdbscan::HdbscanHyperParams::builder()
-        .min_cluster_size(min_cluster_size)
-        .build();
-    let clusterer = Hdbscan::new(&data, hyper_params);
+    let actual_k = k.min(n_reads);
+    if actual_k <= 1 {
+        info!("Phase 1 result: 1 cluster (k clamped to 1)");
+        return vec![0isize; n_reads];
+    }
 
-    // Run clustering
-    let labels = match clusterer.cluster() {
-        Ok(labels) => labels,
-        Err(e) => {
-            warn!("HDBSCAN failed: {:?}. Falling back to single cluster.", e);
-            return vec![0isize; n_reads];
+    // Deterministic RNG for reproducible results
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    // --- K-means++ initialization ---
+    let mut centroids: Vec<Vec<f64>> = Vec::with_capacity(actual_k);
+
+    // Pick first centroid randomly (but deterministically)
+    let first_idx = rng.gen_range(0..n_reads);
+    centroids.push(features.row(first_idx).to_vec());
+
+    // Pick remaining centroids proportional to squared distance
+    for _c in 1..actual_k {
+        let distances: Vec<f64> = (0..n_reads)
+            .map(|i| {
+                centroids
+                    .iter()
+                    .map(|centroid| {
+                        features
+                            .row(i)
+                            .iter()
+                            .zip(centroid.iter())
+                            .map(|(&a, &b)| (a - b).powi(2))
+                            .sum::<f64>()
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            })
+            .collect();
+
+        let total: f64 = distances.iter().sum();
+        if total <= 0.0 {
+            centroids.push(features.row(rng.gen_range(0..n_reads)).to_vec());
+            continue;
         }
-    };
 
-    // Convert i32 labels to isize
-    let clusters: Vec<isize> = labels.iter().map(|&l| l as isize).collect();
+        let threshold = rng.gen::<f64>() * total;
+        let mut cumulative = 0.0;
+        let mut chosen = n_reads - 1;
+        for (i, &d) in distances.iter().enumerate() {
+            cumulative += d;
+            if cumulative >= threshold {
+                chosen = i;
+                break;
+            }
+        }
+        centroids.push(features.row(chosen).to_vec());
+    }
 
-    let unique: HashSet<isize> = clusters.iter().cloned().collect();
-    let noise = clusters.iter().filter(|&&c| c == -1).count();
-    let n_clusters = unique.len() - if noise > 0 { 1 } else { 0 };
-    info!("Phase 1 result: {} coarse clusters, {} noise points ({:.1}%)",
-          n_clusters, noise, 100.0 * noise as f64 / clusters.len() as f64);
+    // --- Lloyd's iterations ---
+    let mut assignments = vec![0isize; n_reads];
 
-    clusters
+    for iter in 0..max_iter {
+        let new_assignments: Vec<isize> = (0..n_reads)
+            .into_par_iter()
+            .map(|i| {
+                let row = features.row(i);
+                centroids
+                    .iter()
+                    .enumerate()
+                    .map(|(c, centroid)| {
+                        let dist: f64 = row
+                            .iter()
+                            .zip(centroid.iter())
+                            .map(|(&a, &b)| (a - b).powi(2))
+                            .sum();
+                        (c as isize, dist)
+                    })
+                    .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                    .unwrap()
+                    .0
+            })
+            .collect();
+
+        if new_assignments == assignments && iter > 0 {
+            info!("K-means converged after {} iterations", iter + 1);
+            break;
+        }
+        assignments = new_assignments;
+
+        for c in 0..actual_k {
+            let mut sum = vec![0.0f64; n_dims];
+            let mut count = 0usize;
+            for i in 0..n_reads {
+                if assignments[i] == c as isize {
+                    for j in 0..n_dims {
+                        sum[j] += features[[i, j]];
+                    }
+                    count += 1;
+                }
+            }
+            if count > 0 {
+                centroids[c] = sum.iter().map(|&s| s / count as f64).collect();
+            }
+        }
+    }
+
+    // Report results
+    let mut cluster_sizes: std::collections::HashMap<isize, usize> = std::collections::HashMap::new();
+    for &a in &assignments {
+        *cluster_sizes.entry(a).or_insert(0) += 1;
+    }
+    info!(
+        "Phase 1 result: {} non-empty clusters from k={} (seed={})",
+        cluster_sizes.len(), actual_k, seed
+    );
+
+    assignments
 }
 
 /// Incremental PCA implementation
@@ -3504,7 +3437,6 @@ async fn run_dashboard(
     gc_scores: HashMap<String, f64>,
     damage_scores: HashMap<String, DamageScore>,
     read_ids: Vec<String>,
-    _min_samples: usize,
     eigenvalues: Vec<f64>,
     total_features: usize,
 ) -> std::io::Result<()> {
@@ -3533,10 +3465,6 @@ async fn run_dashboard(
         dam5_vec.push(dscore.damage5);
         dam3_vec.push(dscore.damage3);
     }
-    
-    // K-distance plot data (legacy DBSCAN feature, no longer computed with HDBSCAN)
-    let k_distance: Vec<f64> = Vec::new();
-    let optimal_eps = 0.0f64;
     
     // Compute cluster statistics
     let unique_clusters: Vec<isize> = clusters.iter()
@@ -3624,8 +3552,6 @@ async fn run_dashboard(
         damage_combined: dam_combined_vec,
         damage5: dam5_vec,
         damage3: dam3_vec,
-        k_distance,
-        optimal_eps,
         cluster_stats,
         total_reads: n,
         num_clusters,
@@ -3776,12 +3702,6 @@ r#"<!DOCTYPE html>
         </div>
         
         <div class="plot-container">
-            <h2>K-distance Plot</h2>
-            <p>This plot helps select the optimal epsilon value. The "elbow" point (where the curve sharply increases) is often a good choice for epsilon.</p>
-            <div id="k_distance_plot" style="width: 100%; height: 400px;"></div>
-        </div>
-        
-        <div class="plot-container">
             <h2>Damage Distribution</h2>
             <div id="damage_plot" style="width: 100%; height: 400px;"></div>
         </div>
@@ -3812,7 +3732,6 @@ r#"<!DOCTYPE html>
         
         // Create initial visualizations
         createPCAPlot();
-        createKDistancePlot();
         createDamagePlot();
         createClusterStatsPlot();
         
@@ -3838,8 +3757,7 @@ r#"<!DOCTYPE html>
                 gc_content: [],
                 damage_combined: [],
                 damage5: [],
-                damage3: [],
-                k_distance: data.k_distance // Keep k_distance unchanged
+                damage3: []
             }};
             
             // Filter points
@@ -3986,156 +3904,6 @@ r#"<!DOCTYPE html>
                 modeBarButtonsToAdd: ['lasso2d', 'select2d'],
                 modeBarButtonsToRemove: ['autoScale2d']
             }});
-        }}
-        
-        function createKDistancePlot() {{
-            // Sort the distances
-            const sortedDistances = [...data.k_distance].sort((a, b) => a - b);
-            
-            // Filter outliers for better visualization
-            const outlierThresholdIdx = Math.min(Math.floor(sortedDistances.length * 0.975), sortedDistances.length - 1);
-            const filteredDistances = sortedDistances.slice(0, outlierThresholdIdx);
-            
-            const trace = {{
-                x: Array.from(Array(filteredDistances.length).keys()),
-                y: filteredDistances,
-                mode: 'lines',
-                type: 'scatter',
-                line: {{
-                    color: 'blue',
-                    width: 2
-                    }},
-                name: 'K-distance'
-            }};
-            
-            // Try to find the elbow point using multiple methods
-            // Method 1: Find point of maximum curvature (normalized space)
-            const x_norm = Array.from(Array(filteredDistances.length).keys())
-                .map(i => i / (filteredDistances.length - 1));
-            
-            const min_dist = filteredDistances[0];
-            const max_dist = filteredDistances[filteredDistances.length - 1];
-            const range = max_dist - min_dist;
-            
-            const y_norm = filteredDistances.map(d => (d - min_dist) / range);
-            
-            // Knee method - find point with maximum distance to line
-            let maxDistance = 0;
-            let kneeIdx = 0;
-            
-            const startX = x_norm[0];
-            const startY = y_norm[0];
-            const endX = x_norm[x_norm.length - 1];
-            const endY = y_norm[x_norm.length - 1];
-            
-            for (let i = 1; i < x_norm.length - 1; i++) {{
-                const x0 = x_norm[i];
-                const y0 = y_norm[i];
-                
-                // Line equation parameters: ax + by + c = 0
-                const a = endY - startY;
-                const b = startX - endX;
-                const c = endX * startY - startX * endY;
-                
-                // Distance from point to line formula
-                const distance = Math.abs(a * x0 + b * y0 + c) / Math.sqrt(a * a + b * b);
-                
-                if (distance > maxDistance) {{
-                    maxDistance = distance;
-                    kneeIdx = i;
-                }}
-            }}
-            
-            // Method 2: Slope change detection
-            let maxSlopeDiff = 0;
-            let slopeChangeIdx = 0;
-            
-            for (let i = 1; i < y_norm.length - 1; i++) {{
-                const prevSlope = y_norm[i] - y_norm[i-1];
-                const nextSlope = y_norm[i+1] - y_norm[i];
-                const slopeDiff = nextSlope - prevSlope;
-                
-                if (slopeDiff > maxSlopeDiff) {{
-                    maxSlopeDiff = slopeDiff;
-                    slopeChangeIdx = i;
-                }}
-            }}
-            
-            // Choose the better elbow point
-            const chosenIdx = Math.abs(kneeIdx - slopeChangeIdx) < filteredDistances.length / 4 ?
-                kneeIdx : // Both methods agree
-                (kneeIdx < slopeChangeIdx ? kneeIdx : slopeChangeIdx); // Prefer earlier elbow
-            
-            const elbowValue = filteredDistances[chosenIdx];
-            
-            // Add points for both methods to the visualization
-            const kneeTrace = {{
-                x: [kneeIdx],
-                y: [filteredDistances[kneeIdx]],
-                mode: 'markers',
-                type: 'scatter',
-                marker: {{
-                    color: 'green',
-                    size: 10,
-                    symbol: 'circle'
-                }},
-                name: 'Knee Method',
-                hovertemplate: 'Knee Method<br>Point: %{{x}}<br>Epsilon: %{{y:.4f}}<extra></extra>'
-            }};
-            
-            const slopeTrace = {{
-                x: [slopeChangeIdx],
-                y: [filteredDistances[slopeChangeIdx]],
-                mode: 'markers',
-                type: 'scatter',
-                marker: {{
-                    color: 'orange',
-                    size: 10,
-                    symbol: 'diamond'
-                }},
-                name: 'Slope Method',
-                hovertemplate: 'Slope Method<br>Point: %{{x}}<br>Epsilon: %{{y:.4f}}<extra></extra>'
-            }};
-            
-            const chosenTrace = {{
-                x: [chosenIdx],
-                y: [elbowValue],
-                mode: 'markers',
-                type: 'scatter',
-                marker: {{
-                    color: 'red',
-                    size: 12,
-                    symbol: 'star'
-                }},
-                name: 'Suggested Epsilon',
-                hovertemplate: 'Suggested Epsilon<br>Point: %{{x}}<br>Epsilon: %{{y:.4f}}<extra></extra>'
-            }};
-            
-            const layout = {{
-                title: 'K-distance Plot (Sorted kth Nearest Neighbor Distances)',
-                xaxis: {{
-                    title: 'Point Index (sorted)',
-                    gridcolor: '#d9d9d9',
-                }},
-                yaxis: {{
-                    title: 'Distance (epsilon)',
-                    gridcolor: '#d9d9d9',
-                }},
-                annotations: [{{
-                    x: chosenIdx,
-                    y: elbowValue,
-                    text: `Suggested ε = ${{elbowValue.toFixed(4)}}`,
-                    showarrow: true,
-                    arrowhead: 2,
-                    arrowsize: 1,
-                    arrowwidth: 2,
-                    arrowcolor: '#636363',
-                    ax: 40,
-                    ay: -40
-                }}]
-            }};
-            
-            Plotly.newPlot('k_distance_plot', [trace, kneeTrace, slopeTrace, chosenTrace], layout, {{responsive: true}});
         }}
         
         function createDamagePlot() {{
@@ -4371,7 +4139,7 @@ fn main() {
         k: matches.get_one::<String>("k").unwrap_or(&String::from("4")).parse().unwrap_or(4),
         output: matches.get_one::<String>("output").unwrap_or(&String::from("cluster_report.csv")).clone(),
         dashboard: matches.get_flag("dashboard"),
-        min_samples: matches.get_one::<String>("min_samples").unwrap_or(&String::from("5")).parse().unwrap_or(5),
+        n_init_clusters: matches.get_one::<String>("n_init_clusters").unwrap_or(&String::from("15")).parse().unwrap_or(15),
         pca_components: matches.get_one::<String>("pca_components").unwrap_or(&String::from("8")).parse().unwrap_or(8),
         damage_window: matches.get_one::<String>("damage_window").unwrap_or(&String::from("5")).parse().unwrap_or(5),
         sim_threshold: matches.get_one::<String>("sim_threshold").unwrap_or(&String::from("0.5")).parse().unwrap_or(0.5),
@@ -4391,9 +4159,10 @@ fn main() {
         assemble: matches.get_flag("assemble"),
         megahit_path: matches.get_one::<String>("megahit_path").unwrap_or(&String::from("megahit")).clone(),
         legacy: matches.get_flag("legacy"),
+        seed: matches.get_one::<String>("seed").unwrap_or(&String::from("42")).parse().unwrap_or(42),
     };
 
-    info!("Starting MADERA Pipeline v0.4.0");
+    info!("Starting MADERA Pipeline v0.4.1");
 
     // Validate parameters
     if args.pca_components > 20 {
@@ -4435,7 +4204,7 @@ fn display_banner() {
              
                                         
 Metagenomic Ancient DNA Evaluation and Reference-free Analysis
-version 0.4.0
+version 0.4.1
 "#);
     println!("An advanced pipeline for ancient DNA quality control, damage pattern analysis,");
     println!("and EM-based iterative clustering without requiring reference genomes.");
@@ -4454,7 +4223,7 @@ version 0.4.0
 /// Setup the help menu and command line arguments
 fn setup_cli() -> Command {
     Command::new("MADERA")
-        .version("0.4.0")
+        .version("0.4.1")
         .about(format!("{}\n{}",
             "MADERA Pipeline: Metagenomic Ancient DNA Evaluation and Reference-free Analysis".bright_green().bold(),
             "An advanced tool for ancient DNA quality control and EM-based iterative clustering".cyan()
@@ -4575,14 +4344,14 @@ fn setup_cli() -> Command {
         // Clustering group
         .group(
             ArgGroup::new("clustering")
-                .arg("min_samples")
+                .arg("n_init_clusters")
                 .multiple(true)
         )
         .arg(
-            Arg::new("min_samples")
-                .long("min_samples")
-                .help(format!("{}: Minimum cluster size for HDBSCAN initial clustering", "Clustering".bright_blue().bold()))
-                .default_value("5")
+            Arg::new("n_init_clusters")
+                .long("n-init-clusters")
+                .help(format!("{}: Number of initial K-means clusters for Phase 1 seeding (generous oversplit, EM merge consolidates)", "Clustering".bright_blue().bold()))
+                .default_value("15")
                 .num_args(1)
                 .value_name("INT")
         )
@@ -4664,7 +4433,7 @@ fn setup_cli() -> Command {
                 .help(format!("{}: Include cluster metadata in exported files", "Cluster Export".bright_blue().bold()))
                 .action(clap::ArgAction::SetTrue)
         )
-        // EM Clustering options (v0.4.0)
+        // EM Clustering options (v0.4.1)
         .group(
             ArgGroup::new("em_clustering")
                 .arg("em_iterations")
@@ -4674,6 +4443,7 @@ fn setup_cli() -> Command {
                 .arg("assemble")
                 .arg("megahit_path")
                 .arg("legacy")
+                .arg("seed") 
                 .multiple(true)
         )
         .arg(
@@ -4728,6 +4498,14 @@ fn setup_cli() -> Command {
                 .help(format!("{}: Use legacy v0.3.1 DBSCAN pipeline instead of EM clustering", "EM Clustering".bright_blue().bold()))
                 .action(clap::ArgAction::SetTrue)
         )
+        .arg(
+            Arg::new("seed")
+                .long("seed")
+                .help(format!("{}: Random seed for K-means++ initialization (deterministic results)", "EM Clustering".bright_blue().bold()))
+                .default_value("42")
+                .num_args(1)
+                .value_name("INT")
+        )
         // Add examples section
         .after_help(format!("{}:\n  {} --fastq samples.fastq --min_length 50 --k 3\n  {} --fastq samples.fastq --dashboard --batch_size 5000 --pca_components 3\n  {} --bam samples.bam --bam-filter unmapped --min_length 35\n  {} --bam samples.bam --bam-filter mapped --damage_threshold 0.7\n  {} --fastq samples.fastq --export-clusters --export-min-size 50 --export-format fasta\n  {} --bam samples.bam --export-clusters --export-min-size 100 --export-output clusters.zip",
             "Examples".underline().cyan(),
@@ -4771,9 +4549,9 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
                           detected_type, expected_type).into());
     }
     
-    info!("Starting MADERA Pipeline v0.4.0");
+    info!("Starting MADERA Pipeline v0.4.1");
     info!("Input file: {} ({})", file_path, detected_type);
-    info!("Pipeline mode: {}", if args.legacy { "Legacy DBSCAN (v0.3.1)" } else { "EM Iterative Clustering (v0.4.0)" });
+    info!("Pipeline mode: {}", if args.legacy { "Legacy DBSCAN (v0.3.1)" } else { "EM Iterative Clustering (v0.4.1)" });
     
     // Quality control
     info!("Performing quality control (min length: {})...", args.min_length);
@@ -5025,12 +4803,9 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             return Err("PCA resulted in zero dimensions. Cannot perform clustering.".into());
         }
 
-        // Legacy pipeline now uses HDBSCAN (DBSCAN code removed in v0.4.0)
-        let hdbscan_min_cluster = std::cmp::max(5, args.min_samples);
-        info!("Legacy pipeline: HDBSCAN clustering on PCA results ({} dims, min_cluster_size={})",
-              actual_dimensions, hdbscan_min_cluster);
-
-        let clusters = hdbscan_initial_clustering(&pca_results, hdbscan_min_cluster);
+        info!("Legacy pipeline: K-means++ clustering on PCA results ({} dims, k={})",
+              actual_dimensions, args.n_init_clusters);
+        let clusters = kmeans_initial_clustering(&pca_results, args.n_init_clusters, 50, args.seed);
 
         info!("Computing cluster statistics...");
         let read_ids: Vec<String> = reads.iter().map(|r| r.id.clone()).collect();
@@ -5085,15 +4860,15 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
             let sys = actix_web::rt::System::new();
             sys.block_on(run_dashboard(
                 pca_results, clusters, gc_scores, damage_score_map,
-                read_ids, args.min_samples, eigenvalues, total_features
+                read_ids, eigenvalues, total_features
             ))?;
         }
 
     } else {
         // =====================================================================
-        // EM PIPELINE (v0.4.0): Robust features → HDBSCAN Phase 1 → EM refinement
+        // EM PIPELINE (v0.4.1): Robust features → K-means++ Phase 1 → EM refinement
         // =====================================================================
-        info!("Running EM iterative clustering pipeline (v0.4.0)");
+        info!("Running EM iterative clustering pipeline (v0.4.1)");
 
         // Optional: MEGAHIT assembly pre-step
         let contigs = if args.assemble {
@@ -5150,13 +4925,14 @@ fn run_pipeline(args: Args) -> Result<(), Box<dyn std::error::Error>> {
         info!("Initial feature matrix: {} × {} (sequences × features)",
               initial_features.nrows(), initial_features.ncols());
 
-        // Phase 1: PCA reduction + HDBSCAN clustering on robust features
+        // Phase 1: PCA reduction + K-means++ clustering on robust features
         let reduced_features = pca_reduce_features(&initial_features, args.pca_components);
 
-        let hdbscan_min_cluster = std::cmp::max(5, args.min_samples);
-        let initial_clusters = hdbscan_initial_clustering(
+        let initial_clusters = kmeans_initial_clustering(
             &reduced_features,
-            hdbscan_min_cluster,
+            args.n_init_clusters,
+            50,        // max K-means iterations
+            args.seed, // deterministic seed
         );
 
         // Phase 2-4: Compute k=4 count vectors and run EM
